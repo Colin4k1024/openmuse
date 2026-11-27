@@ -23,6 +23,7 @@ import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
+import { GitHubAuth } from "./github-auth.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
@@ -38,6 +39,7 @@ export async function createApp(
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
+  const github = new GitHubAuth(db, config);
   const actions = new ActionService(db, {
     execute: (owner, input, connectionId, targetVersion) =>
       workspace.execute(owner, input, connectionId, targetVersion),
@@ -295,6 +297,36 @@ export async function createApp(
     else await google.disconnect(c.get("owner"));
     return c.json({ ok: true });
   });
+  app.get("/api/github/status", async (c) => {
+    const owner = c.get("owner");
+    const probe = await github.probe(owner);
+    return c.json({
+      enabled: github.configured(),
+      mode: config.githubAuthMode ?? "gh-cli",
+      writeEnabled: config.githubWriteEnabled === true,
+      allowedRepos: config.githubAllowedRepos ?? [],
+      state: probe.state,
+      detail: probe.state === "unavailable" ? probe.detail : null,
+      account: probe.state === "connected" ? probe.connection.account : null,
+    });
+  });
+  app.post("/api/github/connect", async (c) => {
+    const owner = c.get("owner");
+    if (!github.configured())
+      throw new AppError("GitHub integration is disabled (GITHUB_ENABLED=false)", 409);
+    if ((config.githubAuthMode ?? "gh-cli") === "pat") {
+      const body = z.object({ token: z.string().min(1).max(4096) }).parse(await c.req.json());
+      return c.json(await github.connectWithToken(owner, body.token), 201);
+    }
+    const connection = await github.connection(owner);
+    if (!connection)
+      throw new AppError("gh CLI is not authenticated. Run gh auth login on the server.", 409);
+    return c.json(connection, 201);
+  });
+  app.post("/api/github/disconnect", async (c) => {
+    await github.disconnect(c.get("owner"));
+    return c.json({ ok: true });
+  });
   app.post("/api/browsers", async (c) => {
     const body = z.object({ url: z.url().max(4096) }).parse(await c.req.json());
     return c.json(await browser.create(c.get("owner"), body.url), 201);
@@ -359,5 +391,5 @@ export async function createApp(
   app.get("/", (c) =>
     c.json({ name: "OpenFuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer };
+  return { app, auth, files, actions, workspace, agent, computer, github };
 }
