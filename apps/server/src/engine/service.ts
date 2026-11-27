@@ -942,12 +942,20 @@ export class AgentService {
     context: TaskContext,
   ) {
     await context.guard();
-    const connection = await this.workspace.connection(owner);
-    if (connection?.id !== task.state.connectionId)
-      throw new AppError(
-        "Google connection changed during this task. Start a new task using the current account.",
-        409,
-      );
+    const isGitHub = input.kind.startsWith("github.");
+    if (isGitHub) {
+      // GitHub proposals bind to the current GitHub connection; its
+      // invalidation lifecycle (#3) expires pending proposals on change.
+      const githubConnection = this.github ? await this.github.connection(owner) : null;
+      if (!githubConnection) throw new AppError("Connect GitHub before preparing an action", 409);
+    } else {
+      const connection = await this.workspace.connection(owner);
+      if (connection?.id !== task.state.connectionId)
+        throw new AppError(
+          "Google connection changed during this task. Start a new task using the current account.",
+          409,
+        );
+    }
     const proposal = await this.actions.propose(owner, input, `${task.id}:${key}`, task.id);
     if (proposal.status === "succeeded") return proposal;
     if (proposal.status !== "awaiting_review" && proposal.status !== "executing")
@@ -1164,7 +1172,7 @@ export class AgentService {
     if (!digest) throw new Error("The digest configuration could not be found");
     if (digest.status === "stopped") return { status: "cancelled", result: "Digest stopped." };
     if (digest.status !== "active") return { status: "paused" };
-    const adapter = this.github?.configured() ? this.github.githubAdapter() : undefined;
+    const adapter = this.github?.configured() ? await this.github.adapterFor(owner) : undefined;
     if (!adapter)
       return {
         status: "waiting_input",

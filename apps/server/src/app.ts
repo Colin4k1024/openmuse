@@ -9,6 +9,7 @@ import { z } from "zod";
 import {
   calendarRangeSchema,
   emailDraftSchema,
+  isGitHubProposal,
   proposalSchema,
 } from "../../../packages/domain/src/index.ts";
 import { ActionService } from "./actions.ts";
@@ -24,6 +25,7 @@ import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GitHubAuth } from "./github-auth.ts";
+import { GitHubExecutor } from "./github-executor.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
@@ -40,12 +42,22 @@ export async function createApp(
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
   const github = options.github ?? new GitHubAuth(db, config);
+  const githubExecutor = new GitHubExecutor(github);
+  const isGitHubKind = (kind?: string) => kind?.startsWith("github.") === true;
   const actions = new ActionService(db, {
     execute: (owner, input, connectionId, targetVersion) =>
-      workspace.execute(owner, input, connectionId, targetVersion),
-    prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
-    connected: (owner) => workspace.connected(owner),
-    connection: (owner) => workspace.connection(owner),
+      isGitHubProposal(input)
+        ? githubExecutor.execute(owner, input)
+        : workspace.execute(owner, input, connectionId, targetVersion),
+    prepare: (owner, input, connectionId) =>
+      isGitHubProposal(input)
+        ? Promise.resolve({ input })
+        : workspace.prepare(owner, input, connectionId),
+    connected: (owner, kind) =>
+      isGitHubKind(kind) ? github.connected(owner) : workspace.connected(owner),
+    connection: async (owner, kind) =>
+      isGitHubKind(kind) ? github.connection(owner) : workspace.connection(owner),
+    label: (kind) => (isGitHubKind(kind) ? "GitHub" : "Google"),
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);

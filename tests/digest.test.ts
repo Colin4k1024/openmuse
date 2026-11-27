@@ -13,7 +13,7 @@ import {
   nextRunAfter,
 } from "../apps/server/src/engine/digest.ts";
 import { GitHubAuth } from "../apps/server/src/github-auth.ts";
-import { type GhRunner, GitHubAdapter, GitHubError } from "../packages/integrations/src/github.ts";
+import { type GhRunner, GitHubError } from "../packages/integrations/src/github.ts";
 
 const REPO = "owner/repo";
 
@@ -79,9 +79,7 @@ async function digestServer(t: TestContext, runner: GhRunner) {
   const db = await createStore();
   t.after(() => db.close());
   const cfg = config(directory);
-  const auth = new GitHubAuth(db, cfg, {
-    adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }),
-  });
+  const auth = new GitHubAuth(db, cfg, { runner });
   const server = await createApp(db, cfg, { github: auth });
   const owner = "digest-owner";
   await server.workspace.ensureSample(owner, server.actions);

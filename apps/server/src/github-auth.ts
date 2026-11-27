@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { GitHubAdapter, GitHubError } from "../../../packages/integrations/src/github.ts";
+import {
+  type GhRunner,
+  GitHubAdapter,
+  GitHubError,
+} from "../../../packages/integrations/src/github.ts";
 import { decryptSecret, encryptSecret } from "../../../packages/integrations/src/vault.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
@@ -45,19 +49,58 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export class GitHubAuth {
   private readonly adapter: GitHubAdapter;
   private readonly fetchFn: FetchLike;
+  private readonly runner?: GhRunner;
 
   constructor(
     private readonly db: Store,
     private readonly config: Config,
-    options: { fetch?: FetchLike; adapter?: GitHubAdapter } = {},
+    options: { fetch?: FetchLike; adapter?: GitHubAdapter; runner?: GhRunner } = {},
   ) {
     this.fetchFn = options.fetch ?? fetch;
+    this.runner = options.runner;
     this.adapter =
       options.adapter ??
       new GitHubAdapter({
         enabled: Boolean(config.githubEnabled),
         allowedRepos: config.githubAllowedRepos ?? [],
+        runner: options.runner,
       });
+  }
+
+  /**
+   * An adapter carrying the current connection's credentials. pat mode injects
+   * GH_TOKEN (and GH_HOST for Enterprise); gh-cli mode inherits the server
+   * session. Throws 409 when no connection exists.
+   */
+  async adapterFor(owner: string): Promise<GitHubAdapter> {
+    return (await this.executionContext(owner)).adapter;
+  }
+
+  /**
+   * Adapter plus the connection identity read from the same credential record,
+   * so a mid-execution 401 can invalidate exactly the connection that ran.
+   */
+  async executionContext(
+    owner: string,
+  ): Promise<{ adapter: GitHubAdapter; connectionId: string | null }> {
+    if (!this.configured())
+      throw new AppError("GitHub integration is disabled (GITHUB_ENABLED=false)", 409);
+    const base = {
+      enabled: true,
+      allowedRepos: this.config.githubAllowedRepos ?? [],
+      writeEnabled: this.config.githubWriteEnabled === true,
+      runner: this.runner,
+    };
+    if (this.config.githubAuthMode === "pat") {
+      const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
+      if (!stored?.secret) throw new AppError("Connect GitHub before using its tools", 409);
+      const { token, connectionId } = this.decode(stored.secret);
+      const host = this.host();
+      const env: Record<string, string> = { GH_TOKEN: token };
+      if (host !== "https://api.github.com") env.GH_HOST = new URL(host).host;
+      return { adapter: new GitHubAdapter({ ...base, env }), connectionId };
+    }
+    return { adapter: new GitHubAdapter(base), connectionId: "gh-cli" };
   }
 
   githubAdapter(): GitHubAdapter {
@@ -227,8 +270,8 @@ export class GitHubAuth {
    * Re-validate a stored PAT against GitHub. A 401 invalidates the connection:
    * the credential is cleared (only if unchanged since we read it) and every
    * connection-bound pending proposal is expired. Returns the remaining
-   * connection, if any. Called from the status route; the write path (#6)
-   * calls it again before executing approvals.
+   * connection, if any. Called from the status route; the write path instead
+   * surfaces a mid-execution 401 through the executor's invalidate().
    */
   async validate(owner: string): Promise<GitHubConnectionInfo | null> {
     const connection = await this.connection(owner);

@@ -24,17 +24,21 @@ interface Options {
     target?: CalendarEvent;
     targetVersion?: string;
   }>;
-  connected: (owner: string) => Promise<boolean>;
-  connection?: (owner: string) => Promise<{ id: string; account: string } | null>;
+  connected: (owner: string, kind?: string) => Promise<boolean>;
+  connection?: (owner: string, kind?: string) => Promise<{ id: string; account: string } | null>;
+  /** Display name for the provider behind a proposal kind (default Google). */
+  label?: (kind?: string) => string;
   now?: () => number;
 }
 export class ActionService {
   private readonly now: () => number;
+  private readonly label: (kind?: string) => string;
   constructor(
     private readonly db: Store,
     private readonly options: Options,
   ) {
     this.now = options.now ?? Date.now;
+    this.label = options.label ?? (() => "Google");
   }
   async propose(
     owner: string,
@@ -51,9 +55,9 @@ export class ActionService {
       if (existing) return existing;
     }
     const parsed = proposalSchema.parse(raw);
-    const connection = await this.options.connection?.(owner);
+    const connection = await this.options.connection?.(owner, parsed.kind);
     if (this.options.connection && !connection)
-      throw new AppError("Connect Google before preparing an action", 409);
+      throw new AppError(`Connect ${this.label(parsed.kind)} before preparing an action`, 409);
     const prepared = await this.options.prepare?.(owner, parsed, connection?.id);
     const input = proposalSchema.parse(prepared?.input ?? parsed);
     const title =
@@ -61,7 +65,15 @@ export class ActionService {
         ? `Send “${input.data.subject}”`
         : input.kind === "calendar.delete"
           ? `Delete ${input.data.title}`
-          : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
+          : input.kind === "github.create_branch"
+            ? `Create branch ${input.data.branch} in ${input.data.repo}`
+            : input.kind === "github.commit_files"
+              ? `Commit ${input.data.files.length} file(s) to ${input.data.repo}:${input.data.branch}`
+              : input.kind === "github.open_pr"
+                ? `Open PR in ${input.data.repo}: ${input.data.title}`
+                : input.kind === "github.comment"
+                  ? `Comment on ${input.data.repo}#${input.data.number}`
+                  : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
     const createdAt = new Date(this.now()).toISOString();
     const proposal: ActionProposal = {
       id,
@@ -133,17 +145,20 @@ export class ActionService {
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
     }
-    if (decision === "approve" && !(await this.options.connected(owner)))
-      throw new AppError("Google is disconnected. Reconnect before approving this action.", 409);
+    if (decision === "approve" && !(await this.options.connected(owner, proposal.kind)))
+      throw new AppError(
+        `${this.label(proposal.kind)} is disconnected. Reconnect before approving this action.`,
+        409,
+      );
     if (decision === "approve" && this.options.connection) {
-      const connection = await this.options.connection(owner);
+      const connection = await this.options.connection(owner, proposal.kind);
       if (
         !connection ||
         connection.id !== proposal.connectionId ||
         connection.account !== proposal.account
       )
         throw new AppError(
-          "Google account or connection changed. Prepare a new action for the connected account.",
+          `${this.label(proposal.kind)} account or connection changed. Prepare a new action for the connected account.`,
           409,
         );
     }

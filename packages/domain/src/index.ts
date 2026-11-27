@@ -129,6 +129,13 @@ export const eventDraftSchema = z
       ctx.addIssue({ code: "custom", message: "Invalid time zone", path: ["timeZone"] });
     }
   });
+const githubRepoSchema = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "Use owner/repo");
+const githubBranchSchema = z
+  .string()
+  .min(1)
+  .max(200)
+  // Characters that corrupt gh api paths/queries or git ref parsing.
+  .regex(/^[^\s~^:?#&%+*[\]\\]+$/, "Branch name contains unsupported characters");
 export const proposalSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("email.send"), data: emailDraftSchema }),
   z.object({ kind: z.literal("calendar.create"), data: eventDraftSchema }),
@@ -140,10 +147,58 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("calendar.delete"),
     data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
   }),
+  z.object({
+    kind: z.literal("github.create_branch"),
+    data: z.object({
+      repo: githubRepoSchema,
+      branch: githubBranchSchema,
+      fromSha: z.string().regex(/^[0-9a-f]{7,40}$/i, "Expected a commit SHA"),
+    }),
+  }),
+  z.object({
+    kind: z.literal("github.commit_files"),
+    data: z.object({
+      repo: githubRepoSchema,
+      branch: githubBranchSchema,
+      message: z.string().min(1).max(500),
+      files: z
+        .array(
+          z.object({
+            path: z.string().min(1).max(500),
+            // Per-argument OS limits (~128KB) keep single contents below this.
+            content: z.string().max(100_000),
+          }),
+        )
+        .min(1)
+        .max(20),
+    }),
+  }),
+  z.object({
+    kind: z.literal("github.open_pr"),
+    data: z.object({
+      repo: githubRepoSchema,
+      head: githubBranchSchema,
+      base: githubBranchSchema,
+      title: z.string().min(1).max(300),
+      body: z.string().max(60_000),
+    }),
+  }),
+  z.object({
+    kind: z.literal("github.comment"),
+    data: z.object({
+      repo: githubRepoSchema,
+      number: z.number().int().positive(),
+      body: z.string().min(1).max(60_000),
+    }),
+  }),
 ]);
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
 export type ProposalInput = z.infer<typeof proposalSchema>;
+export type GitHubProposalInput = Extract<ProposalInput, { kind: `github.${string}` }>;
+export type WorkspaceProposalInput = Exclude<ProposalInput, GitHubProposalInput>;
+export const isGitHubProposal = (input: ProposalInput): input is GitHubProposalInput =>
+  input.kind.startsWith("github.");
 export interface ActionProposal {
   target?: CalendarEvent;
   targetVersion?: string;

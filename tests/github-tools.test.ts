@@ -7,7 +7,7 @@ import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { GitHubAuth } from "../apps/server/src/github-auth.ts";
-import { type GhRunner, GitHubAdapter, GitHubError } from "../packages/integrations/src/github.ts";
+import { type GhRunner, GitHubError } from "../packages/integrations/src/github.ts";
 import { modelFixture } from "./helpers/model.ts";
 
 const REPO = "owner/repo";
@@ -70,7 +70,7 @@ test("github tools are not registered when the integration is disabled", async (
   const auth = new GitHubAuth(
     await createStore(),
     baseConfig(await mkdtemp(join(tmpdir(), "openfuse-gh-off-"))),
-    { adapter: new GitHubAdapter({ enabled: false, allowedRepos: [REPO], runner }) },
+    { runner },
   );
   const { requests } = await modelFixture(t, (index) => calls[index]);
   const calls = [
@@ -107,7 +107,7 @@ test("github_list_prs is served from the operations cache on repeat calls and re
   const auth = new GitHubAuth(
     await createStore(),
     baseConfig(directory, { githubEnabled: true, githubAllowedRepos: [REPO] }),
-    { adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }) },
+    { runner },
   );
   const { requests } = await modelFixture(t, (index) => calls[index]);
   const calls = [
@@ -143,7 +143,7 @@ test("adapter errors reach the model as readable tool errors, not crashes", asyn
   const auth = new GitHubAuth(
     await createStore(),
     baseConfig(directory, { githubEnabled: true, githubAllowedRepos: [REPO] }),
-    { adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }) },
+    { runner },
   );
   await modelFixture(t, (index) => calls[index]);
   const calls = [
@@ -173,7 +173,7 @@ test("repos outside the allowlist are rejected with an actionable error", async 
   const auth = new GitHubAuth(
     await createStore(),
     baseConfig(directory, { githubEnabled: true, githubAllowedRepos: [REPO] }),
-    { adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }) },
+    { runner },
   );
   await modelFixture(t, (index) => calls[index]);
   const calls = [
@@ -201,7 +201,7 @@ test("oversize diffs are clipped before entering model context", async (t) => {
   const auth = new GitHubAuth(
     await createStore(),
     baseConfig(directory, { githubEnabled: true, githubAllowedRepos: [REPO] }),
-    { adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }) },
+    { runner },
   );
   const { requests } = await modelFixture(t, (index) => calls[index]);
   const calls = [
