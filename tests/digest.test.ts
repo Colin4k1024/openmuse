@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
-import { createStore, type Store } from "../apps/server/src/db.ts";
+import { createStore } from "../apps/server/src/db.ts";
 import {
   buildDigestSummary,
   type DigestRecord,

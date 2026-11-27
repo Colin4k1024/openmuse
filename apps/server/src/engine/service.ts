@@ -101,6 +101,8 @@ export class AgentService {
         await this.publishOutcome(owner, value);
       for (const { owner, value } of await this.db.scan<Monitor>("monitors"))
         await this.activateMonitor(owner, value);
+      for (const { owner, value } of await this.db.scan<DigestRecord>("digests"))
+        await this.activateDigest(owner, value);
       for (const { owner, value } of await this.db.scan<Idea>("ideas"))
         if (
           value.status === "accepted" &&
@@ -556,6 +558,8 @@ export class AgentService {
     for (let attempt = 0; attempt < 2; attempt++) {
       const task = await this.getTask(owner, digest.taskId);
       if (task.status === "cancelled") break;
+      // "check" on a paused digest is a no-op; only "resume" reactivates it.
+      if (task.status === "paused" && action === "check") return digest;
       if (task.status === "paused") {
         const marked = await this.db.compareAndSwap(
           owner,
@@ -1174,7 +1178,10 @@ export class AgentService {
     try {
       await ctx.event("step", "Reading GitHub repositories", digest.repos.join(", "));
       const sections: DigestSection[] = [];
-      const evidence = [...task.evidence];
+      // Digest evidence reflects today's open work: prune stale github entries
+      // (closed/retitled PRs) and cap the task record so weeks of runs stay small.
+      const MAX_DIGEST_EVIDENCE = 50;
+      const evidence = task.evidence.filter((entry) => entry.kind !== "github");
       const knownEvidence = new Set(evidence.map((entry) => entry.id));
       for (const repo of digest.repos) {
         const prs = await adapter.listPullRequests(repo, { state: "open", limit: 20 });
@@ -1227,6 +1234,7 @@ export class AgentService {
         `digest:${today}`,
       );
       await ctx.event("result", "Digest ready", summary);
+      await ctx.guard();
       await this.db.compareAndSwap(
         owner,
         "digests",
@@ -1239,7 +1247,7 @@ export class AgentService {
         nextRunAt: nextAt,
         result: summary,
         artifactIds: [...new Set([...task.artifactIds, artifact.id])],
-        evidence,
+        evidence: evidence.slice(-MAX_DIGEST_EVIDENCE),
         state: { ...task.state, failures: 0, notice: null },
       };
     } catch (error) {
