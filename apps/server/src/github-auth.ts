@@ -123,6 +123,9 @@ export class GitHubAuth {
       try {
         connection = await this.validate(owner);
       } catch (error) {
+        // Local credential faults (undecryptable record, missing key) stay
+        // diagnosable 503s; only genuine network failures degrade to unavailable.
+        if (error instanceof AppError) throw error;
         // A network failure is not a revoked token: never invalidate, degrade to unavailable.
         return {
           state: "unavailable",

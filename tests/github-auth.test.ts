@@ -248,6 +248,23 @@ test("status probe degrades to unavailable (not 500) when GitHub is unreachable"
   assert.equal(await auth.connected("u-down"), true);
 });
 
+test("probe surfaces an undecryptable credential as a diagnosable 503, not unavailable", async () => {
+  const { fetch } = patFetch(() => okUser());
+  const auth = new GitHubAuth(db, config(), { fetch });
+  await auth.connectWithToken("u-503", TOKEN);
+  const wrongKey = new GitHubAuth(
+    db,
+    config({ encryptionKey: randomBytes(32).toString("base64") }),
+    { fetch },
+  );
+  await assert.rejects(wrongKey.probe("u-503"), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 503);
+    assert.match(error.message, /TOKEN_ENCRYPTION_KEY/);
+    return true;
+  });
+});
+
 test("gh-cli probe distinguishes not-installed from not-authenticated", async () => {
   const missing = new GitHubAuth(db, config({ githubAuthMode: "gh-cli" }), {
     adapter: new GitHubAdapter({ enabled: true, allowedRepos: [], ghPath: "/nonexistent/gh" }),
