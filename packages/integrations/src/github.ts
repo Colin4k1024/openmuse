@@ -440,7 +440,7 @@ export class GitHubAdapter {
     return { sha: fromSha, created: true };
   }
 
-  /** A recent commit on the branch carrying the idempotency trailer, or null. */
+  /** A commit among the branch's latest 20 carrying the idempotency trailer, or null. */
   async findCommitByMarker(
     repo: string,
     branch: string,
@@ -449,7 +449,9 @@ export class GitHubAdapter {
     const target = this.authorize(repo);
     const commits = await this.json(
       z.array(z.object({ sha: z.string(), commit: z.object({ message: z.string() }) })),
-      ["api", `repos/${target}/commits?sha=${branch}&per_page=20`],
+      // gh api does not URL-encode the endpoint; branch is charset-restricted by
+      // githubBranchSchema, and we encode defensively anyway.
+      ["api", `repos/${target}/commits?sha=${encodeURIComponent(branch)}&per_page=20`],
     );
     for (const commit of commits)
       if (commit.commit.message.includes(marker)) return { sha: commit.sha };
@@ -469,12 +471,12 @@ export class GitHubAdapter {
     idemKey?: string,
   ): Promise<{ sha: string; created: boolean }> {
     const target = this.authorizeWrite(repo);
+    const base = await this.getBranchSha(target, branch);
+    if (!base) throw new GitHubError("not_found", `Branch ${branch} does not exist in ${target}.`);
     if (idemKey) {
       const existing = await this.findCommitByMarker(target, branch, `Openmuse-Idem: ${idemKey}`);
       if (existing) return { sha: existing.sha, created: false };
     }
-    const base = await this.getBranchSha(target, branch);
-    if (!base) throw new GitHubError("not_found", `Branch ${branch} does not exist in ${target}.`);
     const treeArgs = ["api", "-X", "POST", `repos/${target}/git/trees`, "-f", `base_tree=${base}`];
     for (const file of files) {
       treeArgs.push(

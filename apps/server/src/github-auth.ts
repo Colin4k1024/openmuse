@@ -73,6 +73,16 @@ export class GitHubAuth {
    * session. Throws 409 when no connection exists.
    */
   async adapterFor(owner: string): Promise<GitHubAdapter> {
+    return (await this.executionContext(owner)).adapter;
+  }
+
+  /**
+   * Adapter plus the connection identity read from the same credential record,
+   * so a mid-execution 401 can invalidate exactly the connection that ran.
+   */
+  async executionContext(
+    owner: string,
+  ): Promise<{ adapter: GitHubAdapter; connectionId: string | null }> {
     if (!this.configured())
       throw new AppError("GitHub integration is disabled (GITHUB_ENABLED=false)", 409);
     const base = {
@@ -84,13 +94,13 @@ export class GitHubAuth {
     if (this.config.githubAuthMode === "pat") {
       const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
       if (!stored?.secret) throw new AppError("Connect GitHub before using its tools", 409);
-      const { token } = this.decode(stored.secret);
+      const { token, connectionId } = this.decode(stored.secret);
       const host = this.host();
       const env: Record<string, string> = { GH_TOKEN: token };
       if (host !== "https://api.github.com") env.GH_HOST = new URL(host).host;
-      return new GitHubAdapter({ ...base, env });
+      return { adapter: new GitHubAdapter({ ...base, env }), connectionId };
     }
-    return new GitHubAdapter(base);
+    return { adapter: new GitHubAdapter(base), connectionId: "gh-cli" };
   }
 
   githubAdapter(): GitHubAdapter {

@@ -303,6 +303,8 @@ test("an approved identical commit returns the existing commit (idem trailer)", 
   ]);
   const { calls, runner } = ghScript((args) => {
     if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "api" && args[1]?.includes("git/ref/heads/"))
+      return JSON.stringify({ object: { sha: SHA } });
     if (args[0] === "api" && args[1]?.includes("/commits?sha=")) return commitsJson;
     return "";
   });
@@ -361,6 +363,76 @@ test("writes are rejected when GITHUB_WRITE_ENABLED=false", async (t) => {
   const executor = new GitHubExecutor(server.github);
   await assert.rejects(executor.execute(owner, openPr), { code: "disabled" });
   assert.equal(calls.filter((a) => a.includes("POST")).length, 0);
+});
+
+test("branch names with URL-breaking characters cannot be proposed", async (t) => {
+  const { server, owner } = await writeServer(t, async () => ({ stdout: userJson, stderr: "" }));
+  for (const branch of ["feat#x", "a&b", "q?z", "plus+one"])
+    await assert.rejects(
+      server.actions.propose(owner, {
+        kind: "github.create_branch",
+        data: { repo: REPO, branch, fromSha: SHA },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        return true;
+      },
+    );
+});
+
+test("findCommitByMarker encodes the branch in the query", async (t) => {
+  const { GitHubAdapter } = await import("../packages/integrations/src/github.ts");
+  const { calls, runner } = ghScript(() => "[]");
+  const adapter = new GitHubAdapter({
+    enabled: true,
+    writeEnabled: true,
+    allowedRepos: [REPO],
+    runner,
+  });
+  await adapter.findCommitByMarker(REPO, "release/v2", "Openmuse-Idem: x");
+  const api = calls.find((args) => args[0] === "api");
+  assert.ok(api?.[1]?.includes("sha=release%2Fv2"), api?.[1]);
+});
+
+test("a commit to a missing branch fails with a clean not_found", async (t) => {
+  const { runner } = ghScript((args) => {
+    if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "api" && args[1]?.includes("git/ref/heads/"))
+      return new GitHubError("not_found", "gh api failed: 404 Not Found");
+    return "";
+  });
+  const { server, owner } = await writeServer(t, runner);
+  const proposal = await server.actions.propose(owner, {
+    kind: "github.commit_files",
+    data: { repo: REPO, branch: "missing", message: "m", files: [{ path: "a", content: "b" }] },
+  });
+  const decided = await server.actions.decide(owner, proposal.id, proposal.hash, "approve");
+  assert.equal(decided.status, "failed");
+  assert.match(decided.error ?? "", /does not exist/);
+});
+
+test("an oversized commit payload is rejected with a readable 422", async (t) => {
+  const { server, owner } = await writeServer(t, async () => ({ stdout: userJson, stderr: "" }));
+  const executor = new GitHubExecutor(server.github);
+  // 20 x 45k chars of 3-byte characters: valid per schema (<=100k chars/file),
+  // but 2.7MB in UTF-8 bytes — beyond the ~800KB transport cap.
+  const big = "\u4e2d".repeat(45_000);
+  await assert.rejects(
+    executor.execute(owner, {
+      kind: "github.commit_files",
+      data: {
+        repo: REPO,
+        branch: "main",
+        message: "m",
+        files: Array.from({ length: 20 }, (_, i) => ({ path: `f${i}.txt`, content: big })),
+      },
+    }),
+    (error: unknown) => {
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match((error as Error).message, /smaller commits/);
+      return true;
+    },
+  );
 });
 
 test("end to end: model prepare tool pauses for review, approval resumes the task", async (t) => {

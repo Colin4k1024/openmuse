@@ -130,7 +130,12 @@ export const eventDraftSchema = z
     }
   });
 const githubRepoSchema = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "Use owner/repo");
-const githubBranchSchema = z.string().min(1).max(200);
+const githubBranchSchema = z
+  .string()
+  .min(1)
+  .max(200)
+  // Characters that corrupt gh api paths/queries or git ref parsing.
+  .regex(/^[^\s~^:?#&%+*[\]\\]+$/, "Branch name contains unsupported characters");
 export const proposalSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("email.send"), data: emailDraftSchema }),
   z.object({ kind: z.literal("calendar.create"), data: eventDraftSchema }),

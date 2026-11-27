@@ -17,10 +17,10 @@ export class GitHubExecutor {
     const input = proposalSchema.parse(raw);
     if (!input.kind.startsWith("github."))
       throw new AppError(`GitHubExecutor cannot execute ${input.kind}`, 400);
-    const adapter = await this.github.adapterFor(owner);
-    // Capture the connection identity up front so a mid-execution 401 expires
-    // exactly this connection, never a concurrent reconnect (#3 lifecycle).
-    const connection = await this.github.connection(owner);
+    // Adapter and connection identity come from one credential read, so a
+    // mid-execution 401 expires exactly this connection, never a concurrent
+    // reconnect (#3 lifecycle).
+    const { adapter, connectionId } = await this.github.executionContext(owner);
     try {
       switch (input.kind) {
         case "github.create_branch": {
@@ -33,7 +33,7 @@ export class GitHubExecutor {
         case "github.commit_files": {
           const { repo, branch, message, files } = input.data;
           const payload = files.reduce(
-            (sum, file) => sum + file.path.length + file.content.length,
+            (sum, file) => sum + Buffer.byteLength(file.path) + Buffer.byteLength(file.content),
             0,
           );
           if (payload > 800_000)
@@ -75,7 +75,7 @@ export class GitHubExecutor {
       // A mid-execution 401 revokes the connection: clear it and expire the
       // remaining pending proposals bound to it (#3 lifecycle).
       if (error instanceof GitHubError && error.code === "auth_failed")
-        await this.github.invalidate(owner, connection?.id);
+        await this.github.invalidate(owner, connectionId ?? undefined);
       throw error;
     }
   }
