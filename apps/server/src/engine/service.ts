@@ -34,6 +34,14 @@ import type { GitHubAuth } from "../github-auth.ts";
 import { backgroundFailure } from "../log.ts";
 import { SearchService } from "../search.ts";
 import type { WorkspaceService } from "../workspace.ts";
+import {
+  buildDigestSummary,
+  type DigestRecord,
+  type DigestSection,
+  dayKey,
+  digestConfigSchema,
+  nextRunAfter,
+} from "./digest.ts";
 import { analyzeSpending } from "./finance.ts";
 import { executeModelTask, taskAnswers } from "./model.ts";
 import {
@@ -93,6 +101,8 @@ export class AgentService {
         await this.publishOutcome(owner, value);
       for (const { owner, value } of await this.db.scan<Monitor>("monitors"))
         await this.activateMonitor(owner, value);
+      for (const { owner, value } of await this.db.scan<DigestRecord>("digests"))
+        await this.activateDigest(owner, value);
       for (const { owner, value } of await this.db.scan<Idea>("ideas"))
         if (
           value.status === "accepted" &&
@@ -235,6 +245,7 @@ export class AgentService {
       state: {
         connectionId: (await this.workspace.connection(owner))?.id ?? null,
         ...(held && input.kind === "monitor" ? { initializingMonitor: true } : {}),
+        ...(held && input.kind === "digest" ? { initializingDigest: true } : {}),
       },
       createdAt: date(),
       updatedAt: date(),
@@ -259,6 +270,11 @@ export class AgentService {
     if (task.kind === "monitor" && action === "resume") {
       // Both UI entry points must activate the monitor before a worker can claim its task.
       await this.controlMonitor(owner, String(task.input.monitorId), "resume");
+    }
+    if (task.kind === "digest" && action === "resume") {
+      await this.controlDigest(owner, String(task.input.digestId), "resume");
+    }
+    if ((task.kind === "monitor" || task.kind === "digest") && action === "resume") {
       const resumed = await this.getTask(owner, id);
       await this.db.put(owner, "run-events", {
         id: randomUUID(),
@@ -317,6 +333,18 @@ export class AgentService {
           status: action === "cancel" ? "stopped" : action === "pause" ? "paused" : "active",
           nextCheckAt: date(),
           // Clearing the error fences out a failure reconcile that read the task before this.
+          ...(action === "resume" || action === "retry" ? { error: null } : {}),
+        },
+      );
+    if (task.kind === "digest")
+      await this.db.compareAndSwap(
+        owner,
+        "digests",
+        String(task.input.digestId),
+        {},
+        {
+          status: action === "cancel" ? "stopped" : action === "pause" ? "paused" : "active",
+          nextRunAt: date(),
           ...(action === "resume" || action === "retry" ? { error: null } : {}),
         },
       );
@@ -435,6 +463,152 @@ export class AgentService {
     await this.db.insertIfAbsent(owner, "monitors", monitor);
     await this.activateMonitor(owner, monitor);
     return monitor;
+  }
+  async digests(owner: string) {
+    return this.db.list<DigestRecord>(owner, "digests");
+  }
+  async createDigest(owner: string, raw: unknown, idempotencyKey?: string) {
+    const input = digestConfigSchema.parse(raw);
+    if (!this.github?.configured())
+      throw new AppError("GitHub integration is disabled (GITHUB_ENABLED=false)", 409);
+    const allowed = new Set(
+      (this.config.githubAllowedRepos ?? []).map((repo) => repo.toLowerCase()),
+    );
+    for (const repo of input.repos)
+      if (!allowed.has(repo.toLowerCase()))
+        throw new AppError(`Repository ${repo} is not in GITHUB_ALLOWED_REPOS`, 422);
+    const id = idempotencyKey ? hash(`digest:${idempotencyKey}`) : randomUUID();
+    const existing = await this.db.get<DigestRecord>(owner, "digests", id);
+    if (existing) {
+      await this.activateDigest(owner, existing);
+      return existing;
+    }
+    const title = input.title ?? `GitHub digest · ${input.repos.join(", ")}`;
+    const task = await this.createTask(
+      owner,
+      {
+        kind: "digest",
+        title,
+        prompt: `Every day at ${String(input.hour).padStart(2, "0")}:00 local, summarize open PRs, failing checks and open issues for: ${input.repos.join(", ")}`,
+        input: { digestId: id },
+      },
+      `digest:${id}`,
+      true,
+    );
+    const digest: DigestRecord = {
+      id,
+      taskId: task.id,
+      title,
+      repos: input.repos,
+      hour: input.hour,
+      status: "active",
+      nextRunAt: date(),
+      failures: 0,
+      createdAt: date(),
+    };
+    await this.db.insertIfAbsent(owner, "digests", digest);
+    await this.activateDigest(owner, digest);
+    return digest;
+  }
+  private async activateDigest(owner: string, digest: DigestRecord) {
+    if (digest.status !== "active") return null;
+    const task = await this.getTask(owner, digest.taskId);
+    if (task.status !== "paused") return null;
+    if (task.state.resumingDigest)
+      return this.db.compareAndSwap(
+        owner,
+        "tasks",
+        task.id,
+        { status: "paused", state: { resumingDigest: true } },
+        {
+          status: "queued",
+          nextRunAt: date(),
+          leaseId: null,
+          leaseUntil: null,
+          error: null,
+          state: { ...task.state, resumingDigest: false, failures: 0, notice: null },
+        },
+      );
+    if (!task.state.initializingDigest) return null;
+    return this.db.compareAndSwap(
+      owner,
+      "tasks",
+      task.id,
+      { status: "paused", attempts: 0, state: { initializingDigest: true } },
+      { status: "queued", state: { ...task.state, initializingDigest: false } },
+    );
+  }
+  async controlDigest(owner: string, id: string, action: "pause" | "resume" | "stop" | "check") {
+    const digest = await this.db.get<DigestRecord>(owner, "digests", id);
+    if (!digest) throw new AppError("Digest not found", 404);
+    if (digest.status === "stopped" && action !== "stop")
+      throw new AppError("Create a new digest to restart this stopped one", 409);
+    if (action === "pause" || action === "stop") {
+      const saved = await this.db.compareAndSwap<DigestRecord>(
+        owner,
+        "digests",
+        id,
+        {},
+        { status: action === "pause" ? "paused" : "stopped", nextRunAt: date() },
+      );
+      const task = await this.getTask(owner, digest.taskId);
+      await this.control(owner, task.id, action === "pause" ? "pause" : "cancel");
+      return saved ?? digest;
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const task = await this.getTask(owner, digest.taskId);
+      if (task.status === "cancelled") break;
+      // "check" on a paused digest is a no-op; only "resume" reactivates it.
+      if (task.status === "paused" && action === "check") return digest;
+      if (task.status === "paused") {
+        const marked = await this.db.compareAndSwap(
+          owner,
+          "tasks",
+          task.id,
+          { status: "paused", leaseId: task.leaseId ?? null },
+          { state: { ...task.state, resumingDigest: true } },
+        );
+        if (!marked) break;
+        const activated = await this.db.compareAndSwap<DigestRecord>(
+          owner,
+          "digests",
+          id,
+          { status: digest.status },
+          { status: "active", nextRunAt: date(), error: null },
+        );
+        const saved = activated ?? (await this.db.get<DigestRecord>(owner, "digests", id));
+        if (saved?.status === "active" && (await this.activateDigest(owner, saved))) return saved;
+        await this.db.compareAndSwap(
+          owner,
+          "tasks",
+          task.id,
+          { status: "paused", state: { resumingDigest: true } },
+          { state: { ...task.state, resumingDigest: false } },
+        );
+        if (saved?.status === "active") return saved;
+      } else if (action === "check") {
+        // Force the next run now: requeue the scheduled task.
+        await this.db.compareAndSwap<DigestRecord>(
+          owner,
+          "digests",
+          id,
+          {},
+          {
+            nextRunAt: date(),
+          },
+        );
+        if (task.status === "scheduled")
+          await this.db.compareAndSwap(
+            owner,
+            "tasks",
+            task.id,
+            { status: "scheduled" },
+            { status: "queued", nextRunAt: date(), leaseId: null, leaseUntil: null },
+          );
+        return (await this.db.get<DigestRecord>(owner, "digests", id)) ?? digest;
+      }
+    }
+    return (await this.db.get<DigestRecord>(owner, "digests", id)) ?? digest;
   }
   private async activateMonitor(owner: string, monitor: Monitor) {
     if (monitor.status !== "active") return null;
@@ -828,6 +1002,7 @@ export class AgentService {
       else return { status: "waiting_approval" };
     }
     if (task.kind === "document") return this.document(owner, task, context);
+    if (task.kind === "digest") return this.digestRun(owner, task, context);
     if (task.kind === "monitor") {
       try {
         return await this.observe(owner, task, context);
@@ -974,6 +1149,139 @@ export class AgentService {
         { status: "active", error: task.error },
         { status: "paused" },
       );
+  }
+  /**
+   * One daily digest run (Issue #5). Exactly-once per local day via
+   * digest.lastRunDay; the artifact id is deterministic per day so a crash
+   * after the artifact write but before the final checkpoint never duplicates.
+   */
+  private async digestRun(
+    owner: string,
+    task: AgentTask,
+    ctx: TaskContext,
+  ): Promise<Partial<AgentTask>> {
+    const digest = await this.db.get<DigestRecord>(owner, "digests", String(task.input.digestId));
+    if (!digest) throw new Error("The digest configuration could not be found");
+    if (digest.status === "stopped") return { status: "cancelled", result: "Digest stopped." };
+    if (digest.status !== "active") return { status: "paused" };
+    const adapter = this.github?.configured() ? this.github.githubAdapter() : undefined;
+    if (!adapter)
+      return {
+        status: "waiting_input",
+        question:
+          "GitHub integration is disabled. Set GITHUB_ENABLED=true on the server, then resume.",
+      };
+    const now = new Date();
+    const today = dayKey(now);
+    const nextAt = nextRunAfter(now, digest.hour);
+    if (digest.lastRunDay === today) return { status: "scheduled", nextRunAt: nextAt };
+    try {
+      await ctx.event("step", "Reading GitHub repositories", digest.repos.join(", "));
+      const sections: DigestSection[] = [];
+      // Digest evidence reflects today's open work: prune stale github entries
+      // (closed/retitled PRs) and cap the task record so weeks of runs stay small.
+      const MAX_DIGEST_EVIDENCE = 50;
+      const evidence = task.evidence.filter((entry) => entry.kind !== "github");
+      const knownEvidence = new Set(evidence.map((entry) => entry.id));
+      for (const repo of digest.repos) {
+        const prs = await adapter.listPullRequests(repo, { state: "open", limit: 20 });
+        const issues = await adapter.listIssues(repo, { state: "open", limit: 10 });
+        const failing: { pr: number; checks: string[] }[] = [];
+        for (const pr of prs.slice(0, 10)) {
+          const checks = await adapter.getChecksStatus(repo, pr.number);
+          const failed = checks
+            .filter((check) => check.bucket === "fail")
+            .map((check) => check.name);
+          if (failed.length) failing.push({ pr: pr.number, checks: failed });
+        }
+        sections.push({
+          repo,
+          openPrs: prs.map((pr) => ({
+            number: pr.number,
+            title: pr.title,
+            url: pr.url,
+            draft: pr.isDraft,
+          })),
+          failingChecks: failing,
+          openIssues: issues.map((issue) => ({
+            number: issue.number,
+            title: issue.title,
+            url: issue.url,
+            labels: issue.labels.map((label) => label.name),
+          })),
+        });
+        for (const pr of prs.slice(0, 10)) {
+          const evidenceId = `github:${repo.toLowerCase()}#${pr.number}`;
+          if (knownEvidence.has(evidenceId)) continue;
+          knownEvidence.add(evidenceId);
+          evidence.push({
+            id: evidenceId,
+            kind: "github",
+            title: `PR #${pr.number}: ${pr.title}`,
+            excerpt: `${pr.state} · ${pr.headRefName} → ${pr.baseRefName}`,
+            url: pr.url,
+          });
+        }
+      }
+      const summary = buildDigestSummary(today, sections);
+      const artifact = await this.artifact(
+        owner,
+        task,
+        "report",
+        `${digest.title} — ${today}`,
+        summary,
+        { sections },
+        `digest:${today}`,
+      );
+      await ctx.event("result", "Digest ready", summary);
+      await ctx.guard();
+      await this.db.compareAndSwap(
+        owner,
+        "digests",
+        digest.id,
+        {},
+        { lastRunDay: today, failures: 0, error: null, nextRunAt: nextAt },
+      );
+      return {
+        status: "scheduled",
+        nextRunAt: nextAt,
+        result: summary,
+        artifactIds: [...new Set([...task.artifactIds, artifact.id])],
+        evidence: evidence.slice(-MAX_DIGEST_EVIDENCE),
+        state: { ...task.state, failures: 0, notice: null },
+      };
+    } catch (error) {
+      if (error instanceof LostLeaseError || ctx.signal.aborted) throw error;
+      await ctx.guard();
+      const failures = (digest.failures ?? 0) + 1;
+      const detail = error instanceof Error ? error.message : "GitHub digest failed";
+      const backoffAt = new Date(Date.now() + Math.min(60, 2 ** failures) * 60000).toISOString();
+      await this.db.compareAndSwap(
+        owner,
+        "digests",
+        digest.id,
+        {},
+        { error: detail, failures, nextRunAt: backoffAt },
+      );
+      await ctx.event(
+        "error",
+        failures >= 5 ? "Digest paused after repeated failures" : "Digest failed; retry scheduled",
+        detail,
+      );
+      if (failures >= 5)
+        return {
+          status: "waiting_input",
+          error: detail,
+          question: `The GitHub digest failed ${failures} times in a row (${detail}). Check the GitHub connection, then resume.`,
+          state: { ...task.state, failures },
+        };
+      return {
+        status: "scheduled",
+        error: detail,
+        nextRunAt: backoffAt,
+        state: { ...task.state, failures },
+      };
+    }
   }
   private async document(
     owner: string,

@@ -84,6 +84,16 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       .parse(await c.req.json());
     return c.json(await service.controlMonitor(c.get("owner"), c.req.param("id"), action));
   });
+  app.get("/digests", async (c) => c.json(await service.digests(c.get("owner"))));
+  app.post("/digests", async (c) =>
+    c.json(await service.createDigest(c.get("owner"), await c.req.json()), 201),
+  );
+  app.post("/digests/:id/control", async (c) => {
+    const { action } = z
+      .object({ action: z.enum(["pause", "resume", "stop", "check"]) })
+      .parse(await c.req.json());
+    return c.json(await service.controlDigest(c.get("owner"), c.req.param("id"), action));
+  });
   app.post("/ideas/refresh", async (c) => c.json(await service.refreshIdeas(c.get("owner"))));
   app.post("/ideas/:id", async (c) => {
     const body = z
