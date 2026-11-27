@@ -7,7 +7,7 @@ import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { GitHubAuth } from "../apps/server/src/github-auth.ts";
-import { type GhRunner, GitHubAdapter, GitHubError } from "../packages/integrations/src/github.ts";
+import { type GhRunner, GitHubError } from "../packages/integrations/src/github.ts";
 import { modelFixture } from "./helpers/model.ts";
 
 const REPO = "owner/repo";
