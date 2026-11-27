@@ -160,11 +160,12 @@ export const proposalSchema = z.discriminatedUnion("kind", [
         .array(
           z.object({
             path: z.string().min(1).max(500),
-            content: z.string().max(400_000),
+            // Per-argument OS limits (~128KB) keep single contents below this.
+            content: z.string().max(100_000),
           }),
         )
         .min(1)
-        .max(50),
+        .max(20),
     }),
   }),
   z.object({

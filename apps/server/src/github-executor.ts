@@ -18,6 +18,9 @@ export class GitHubExecutor {
     if (!input.kind.startsWith("github."))
       throw new AppError(`GitHubExecutor cannot execute ${input.kind}`, 400);
     const adapter = await this.github.adapterFor(owner);
+    // Capture the connection identity up front so a mid-execution 401 expires
+    // exactly this connection, never a concurrent reconnect (#3 lifecycle).
+    const connection = await this.github.connection(owner);
     try {
       switch (input.kind) {
         case "github.create_branch": {
@@ -29,8 +32,23 @@ export class GitHubExecutor {
         }
         case "github.commit_files": {
           const { repo, branch, message, files } = input.data;
-          const result = await adapter.commitFiles(repo, branch, message, files);
-          return `Committed ${files.length} file(s) to ${repo}:${branch} as ${result.sha.slice(0, 12)}`;
+          const payload = files.reduce(
+            (sum, file) => sum + file.path.length + file.content.length,
+            0,
+          );
+          if (payload > 800_000)
+            throw new AppError(
+              `Commit payload is ${Math.ceil(payload / 1000)}KB; split into smaller commits (transport limit is ~800KB).`,
+              422,
+            );
+          const idemKey = createHash("sha256")
+            .update(`github.commit_files:${repo}:${branch}:${JSON.stringify(input.data)}`)
+            .digest("hex")
+            .slice(0, 16);
+          const result = await adapter.commitFiles(repo, branch, message, files, idemKey);
+          return result.created
+            ? `Committed ${files.length} file(s) to ${repo}:${branch} as ${result.sha.slice(0, 12)}`
+            : `Commit already on ${repo}:${branch} as ${result.sha.slice(0, 12)}`;
         }
         case "github.open_pr": {
           const { repo, head, base, title, body } = input.data;
@@ -57,7 +75,7 @@ export class GitHubExecutor {
       // A mid-execution 401 revokes the connection: clear it and expire the
       // remaining pending proposals bound to it (#3 lifecycle).
       if (error instanceof GitHubError && error.code === "auth_failed")
-        await this.github.invalidate(owner);
+        await this.github.invalidate(owner, connection?.id);
       throw error;
     }
   }

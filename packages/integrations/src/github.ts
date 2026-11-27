@@ -141,6 +141,15 @@ function classifyGhError(stderr: string): GitHubErrorCode {
   return "api";
 }
 
+/** True when the failure left the server-side outcome unknown (transport/5xx). */
+export function isAmbiguousGhError(error: unknown): boolean {
+  return (
+    error instanceof GitHubError &&
+    error.code === "api" &&
+    /timeout|timed out|eof|connection|socket|\b50[0234]\b/i.test(error.message)
+  );
+}
+
 function limit(value: number | undefined): string {
   const parsed = value !== undefined && Number.isFinite(value) ? Math.trunc(value) : DEFAULT_LIMIT;
   return String(Math.min(Math.max(parsed, 1), MAX_LIMIT));
@@ -431,14 +440,39 @@ export class GitHubAdapter {
     return { sha: fromSha, created: true };
   }
 
-  /** One commit containing all file changes, via the git trees API. */
+  /** A recent commit on the branch carrying the idempotency trailer, or null. */
+  async findCommitByMarker(
+    repo: string,
+    branch: string,
+    marker: string,
+  ): Promise<{ sha: string } | null> {
+    const target = this.authorize(repo);
+    const commits = await this.json(
+      z.array(z.object({ sha: z.string(), commit: z.object({ message: z.string() }) })),
+      ["api", `repos/${target}/commits?sha=${branch}&per_page=20`],
+    );
+    for (const commit of commits)
+      if (commit.commit.message.includes(marker)) return { sha: commit.sha };
+    return null;
+  }
+
+  /**
+   * One commit containing all file changes, via the git trees API. An idemKey adds
+   * an Openmuse-Idem trailer so a re-approved identical change returns the
+   * existing commit instead of duplicating it.
+   */
   async commitFiles(
     repo: string,
     branch: string,
     message: string,
     files: { path: string; content: string }[],
-  ): Promise<{ sha: string }> {
+    idemKey?: string,
+  ): Promise<{ sha: string; created: boolean }> {
     const target = this.authorizeWrite(repo);
+    if (idemKey) {
+      const existing = await this.findCommitByMarker(target, branch, `Openmuse-Idem: ${idemKey}`);
+      if (existing) return { sha: existing.sha, created: false };
+    }
     const base = await this.getBranchSha(target, branch);
     if (!base) throw new GitHubError("not_found", `Branch ${branch} does not exist in ${target}.`);
     const treeArgs = ["api", "-X", "POST", `repos/${target}/git/trees`, "-f", `base_tree=${base}`];
@@ -461,14 +495,15 @@ export class GitHubAdapter {
       "POST",
       `repos/${target}/git/commits`,
       "-f",
-      `message=${message}`,
+      `message=${idemKey ? `${message}\n\nOpenmuse-Idem: ${idemKey}` : message}`,
       "-f",
       `tree=${tree.sha}`,
       "-f",
       `parents[]=${base}`,
     ]);
-    // The ref update is idempotent (same target SHA), so retrying it once after a
-    // transport hiccup cannot create a second commit or move the branch twice.
+    // The ref update is idempotent (same target SHA, fast-forward enforced), so
+    // retrying once after an *ambiguous* transport failure is safe; definitive
+    // 4xx rejections (e.g. branch protection) are never retried.
     try {
       await this.json(z.looseObject({ ref: z.string() }), [
         "api",
@@ -479,7 +514,7 @@ export class GitHubAdapter {
         `sha=${commit.sha}`,
       ]);
     } catch (error) {
-      if (error instanceof GitHubError && error.code === "api") {
+      if (isAmbiguousGhError(error)) {
         await this.json(z.looseObject({ ref: z.string() }), [
           "api",
           "-X",
@@ -490,7 +525,7 @@ export class GitHubAdapter {
         ]);
       } else throw error;
     }
-    return { sha: commit.sha };
+    return { sha: commit.sha, created: true };
   }
 
   /** The open PR for a head branch, or null. */

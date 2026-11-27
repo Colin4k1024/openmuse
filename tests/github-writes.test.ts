@@ -211,9 +211,10 @@ test("create_branch succeeds when the branch exists at the requested SHA", async
   assert.equal(calls.filter((a) => a.includes("POST")).length, 0);
 });
 
-test("branch protection refusal fails the proposal with a readable error", async (t) => {
-  const { runner } = ghScript((args) => {
+test("branch protection refusal fails the proposal with a readable error and no retry", async (t) => {
+  const { calls, runner } = ghScript((args) => {
     if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "api" && args[1]?.includes("/commits?sha=")) return "[]";
     if (args[0] === "api" && args[1]?.includes("git/ref/heads/"))
       return JSON.stringify({ object: { sha: SHA } });
     if (args[0] === "api" && args.includes("POST") && args[3]?.includes("git/trees"))
@@ -237,6 +238,87 @@ test("branch protection refusal fails the proposal with a readable error", async
   const decided = await server.actions.decide(owner, proposal.id, proposal.hash, "approve");
   assert.equal(decided.status, "failed");
   assert.match(decided.error ?? "", /403|Protected/i);
+  assert.equal(
+    calls.filter((a) => a.includes("PATCH")).length,
+    1,
+    "a definitive 4xx refusal is never retried",
+  );
+});
+
+test("a racing PR creator (already exists) resolves to the existing PR", async (t) => {
+  const { calls, runner } = ghScript((args) => {
+    if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "pr" && args[1] === "list")
+      // First lookup (pre-create) empty; post-race lookup finds the PR.
+      return calls.some((c) => c[0] === "pr" && c[1] === "create") ? prExistsJson : noPrs;
+    if (args[0] === "pr" && args[1] === "create")
+      return new GitHubError(
+        "api",
+        "gh pr create failed: a pull request for branch fix/x already exists",
+      );
+    return "";
+  });
+  const { server, owner } = await writeServer(t, runner);
+  const proposal = await server.actions.propose(owner, openPr);
+  const decided = await server.actions.decide(owner, proposal.id, proposal.hash, "approve");
+  assert.equal(decided.status, "succeeded");
+  assert.match(decided.result ?? "", /already open/);
+});
+
+test("every executed write persists an activity receipt", async (t) => {
+  const { runner } = ghScript((args) => {
+    if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "pr" && args[1] === "list") return prExistsJson;
+    return "";
+  });
+  const { db, server, owner } = await writeServer(t, runner);
+  const proposal = await server.actions.propose(owner, openPr);
+  await server.actions.decide(owner, proposal.id, proposal.hash, "approve");
+  const activity = await db.list<{ status: string; detail: string }>(owner, "activity");
+  const receipt = activity.filter((entry) => entry.status === "succeeded");
+  assert.ok(receipt.length >= 1, "a succeeded receipt is persisted");
+  assert.ok(
+    receipt.some((entry) => entry.detail.includes("github.com/owner/repo/pull/12")),
+    "receipt carries the PR URL",
+  );
+});
+
+test("an approved identical commit returns the existing commit (idem trailer)", async (t) => {
+  const { createHash } = await import("node:crypto");
+  const data = {
+    repo: REPO,
+    branch: "main",
+    message: "fix: patch",
+    files: [{ path: "a.txt", content: "hello" }],
+  };
+  const idemKey = createHash("sha256")
+    .update(`github.commit_files:${REPO}:main:${JSON.stringify(data)}`)
+    .digest("hex")
+    .slice(0, 16);
+  const commitsJson = JSON.stringify([
+    {
+      sha: "d".repeat(40),
+      commit: { message: `fix: patch\n\nOpenmuse-Idem: ${idemKey}` },
+    },
+  ]);
+  const { calls, runner } = ghScript((args) => {
+    if (args[0] === "api" && args[1] === "user") return userJson;
+    if (args[0] === "api" && args[1]?.includes("/commits?sha=")) return commitsJson;
+    return "";
+  });
+  const { server, owner } = await writeServer(t, runner);
+  const proposal = await server.actions.propose(owner, {
+    kind: "github.commit_files",
+    data,
+  });
+  const decided = await server.actions.decide(owner, proposal.id, proposal.hash, "approve");
+  assert.equal(decided.status, "succeeded");
+  assert.match(decided.result ?? "", /Commit already on/);
+  assert.equal(
+    calls.filter((a) => a.includes("POST")).length,
+    0,
+    "marker hit means no tree/commit writes",
+  );
 });
 
 test("a 401 mid-execution invalidates the PAT connection and expires pending proposals", async (t) => {

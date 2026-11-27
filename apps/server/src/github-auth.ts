@@ -260,8 +260,8 @@ export class GitHubAuth {
    * Re-validate a stored PAT against GitHub. A 401 invalidates the connection:
    * the credential is cleared (only if unchanged since we read it) and every
    * connection-bound pending proposal is expired. Returns the remaining
-   * connection, if any. Called from the status route; the write path (#6)
-   * calls it again before executing approvals.
+   * connection, if any. Called from the status route; the write path instead
+   * surfaces a mid-execution 401 through the executor's invalidate().
    */
   async validate(owner: string): Promise<GitHubConnectionInfo | null> {
     const connection = await this.connection(owner);
