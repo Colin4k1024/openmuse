@@ -208,10 +208,14 @@ export class GitHubAdapter {
     this.run = options.runner ?? createGhRunner(options.ghPath ?? "gh");
   }
 
-  /** Rejects disabled adapters and non-allowlisted repos before any spawn. */
-  private authorize(repo: string): string {
+  private assertEnabled(): void {
     if (!this.enabled)
       throw new GitHubError("disabled", "GitHub integration is disabled (GITHUB_ENABLED=false).");
+  }
+
+  /** Rejects disabled adapters and non-allowlisted repos before any spawn. */
+  private authorize(repo: string): string {
+    this.assertEnabled();
     const normalized = repo.trim().toLowerCase();
     if (!REPO_PATTERN.test(normalized))
       throw new GitHubError(
@@ -241,6 +245,12 @@ export class GitHubAdapter {
         `gh output failed validation for ${args[0]}: ${result.error.issues[0]?.message ?? "schema mismatch"}`,
       );
     return result.data;
+  }
+
+  /** Identity of the authenticated user; repo-independent, needs no allowlist entry. */
+  async getAuthenticatedUser(): Promise<{ login: string }> {
+    this.assertEnabled();
+    return this.json(z.object({ login: z.string() }), ["api", "user"]);
   }
 
   async listPullRequests(

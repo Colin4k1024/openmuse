@@ -61,6 +61,12 @@ export interface Config {
   e2bApiKey?: string;
   allowedOrigins: string[];
   trustProxy?: boolean;
+  /** GitHub integration (docs/GITHUB-INTEGRATION.md). All off by default. */
+  githubEnabled?: boolean;
+  githubWriteEnabled?: boolean;
+  githubAuthMode?: "gh-cli" | "pat";
+  githubAllowedRepos?: string[];
+  githubApiHost?: string;
 }
 
 export type ComputerProvider = "docker" | "e2b-desktop";
@@ -150,6 +156,26 @@ export function readConfig(): Config {
   }
   const port = Number(process.env.PORT ?? 8787);
   const publicUrl = process.env.PUBLIC_API_URL ?? `http://localhost:${port}`;
+  const githubAuthModeEnv = process.env.GITHUB_AUTH_MODE?.trim() || "gh-cli";
+  if (githubAuthModeEnv !== "gh-cli" && githubAuthModeEnv !== "pat")
+    throw new Error("GITHUB_AUTH_MODE must be gh-cli or pat");
+  const githubAuthMode: "gh-cli" | "pat" = githubAuthModeEnv;
+  const githubApiHost = (process.env.GITHUB_API_HOST?.trim() || "https://api.github.com").replace(
+    /\/+$/,
+    "",
+  );
+  if (!githubApiHost.startsWith("https://"))
+    throw new Error("GITHUB_API_HOST must be an https:// URL");
+  if (process.env.GITHUB_WRITE_ENABLED === "true" && process.env.GITHUB_ENABLED !== "true")
+    throw new Error("GITHUB_WRITE_ENABLED requires GITHUB_ENABLED=true");
+  if (
+    process.env.GITHUB_ENABLED === "true" &&
+    githubAuthMode === "pat" &&
+    !process.env.TOKEN_ENCRYPTION_KEY
+  )
+    throw new Error(
+      "GITHUB_AUTH_MODE=pat requires TOKEN_ENCRYPTION_KEY (32-byte base64) to encrypt tokens at rest",
+    );
   const config: Config = {
     mode,
     port,
@@ -187,6 +213,14 @@ export function readConfig(): Config {
     // Only trust X-Forwarded-For/X-Real-IP when the deployment is known to sit
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
+    githubEnabled: process.env.GITHUB_ENABLED === "true",
+    githubWriteEnabled: process.env.GITHUB_WRITE_ENABLED === "true",
+    githubAuthMode,
+    githubAllowedRepos: (process.env.GITHUB_ALLOWED_REPOS ?? "")
+      .split(",")
+      .map((repo) => repo.trim())
+      .filter(Boolean),
+    githubApiHost,
   };
   if (
     mode === "live" &&
