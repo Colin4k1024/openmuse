@@ -12,7 +12,7 @@ export type TaskStatus =
   | "cancelled";
 export interface Evidence {
   id: string;
-  kind: "mail" | "file" | "web" | "user";
+  kind: "mail" | "file" | "web" | "user" | "github";
   title: string;
   excerpt: string;
   url?: string;
