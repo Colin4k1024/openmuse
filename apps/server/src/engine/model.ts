@@ -98,16 +98,30 @@ export async function executeModelTask(
   // (GITHUB_ENABLED=true); there is no GitHub write tool — changes go through
   // reviewed proposals (#6).
   const github = service.github?.configured() ? service.github.githubAdapter() : undefined;
+  // Evidence lands in the system prompt on later runs; cap per-task growth so a
+  // long review session cannot balloon task state without bound.
+  const MAX_GITHUB_EVIDENCE = 50;
   const addGitHubEvidence = async (
     items: { id: string; title: string; excerpt: string; url?: string }[],
   ) => {
     const known = new Set(task.evidence.map((entry) => entry.id));
     const fresh = items.filter((item) => !known.has(item.id));
     if (!fresh.length) return;
+    const existing = task.evidence.filter((entry) => entry.kind === "github").length;
+    const budget = Math.max(0, MAX_GITHUB_EVIDENCE - existing);
+    const accepted = fresh.slice(0, budget);
+    if (!accepted.length) return;
     task = await ctx.checkpoint({
-      evidence: [...task.evidence, ...fresh.map((item) => ({ ...item, kind: "github" as const }))],
+      evidence: [
+        ...task.evidence,
+        ...accepted.map((item) => ({ ...item, kind: "github" as const })),
+      ],
     });
   };
+  // Note on replay: cached() persists results after the operation, so a crash
+  // between a gh read and its operations checkpoint re-issues the read once.
+  // That is safe here because every github_* tool is read-only; no write tool
+  // exists in this phase.
   const tools = [
     ...computerTools(service.computer, service.files, owner, `task:${task.id}`, {
       signal: ctx.signal,
@@ -291,9 +305,17 @@ export async function executeModelTask(
             async (args) =>
               cached("github_read_pr_diff", args, async () => {
                 const { diff, truncated } = await github.getPullRequestDiff(args.repo, args.number);
-                const clipped = diff.length > 30000;
+                // Advisory context budget in code units; never split a surrogate pair.
+                let clippedDiff = diff;
+                if (clippedDiff.length > 30000) {
+                  clippedDiff = clippedDiff.slice(0, 30000);
+                  const last = clippedDiff.charCodeAt(clippedDiff.length - 1);
+                  if (last >= 0xd800 && last <= 0xdbff)
+                    clippedDiff = clippedDiff.slice(0, clippedDiff.length - 1);
+                }
+                const clipped = clippedDiff.length < diff.length;
                 return {
-                  diff: clipped ? `${diff.slice(0, 30000)}\n…clipped for context…` : diff,
+                  diff: clipped ? `${clippedDiff}\n…clipped for context…` : clippedDiff,
                   truncated: truncated || clipped,
                 };
               }),

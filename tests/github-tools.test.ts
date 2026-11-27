@@ -93,6 +93,12 @@ test("github tools are not registered when the integration is disabled", async (
     requests.some((request) => request.body.includes("github_list_prs")),
     "the model attempted the tool",
   );
+  // The SDK answers unregistered tools with an output-error result; asserting on
+  // it proves the tool was absent, not merely that a disabled adapter refused.
+  assert.ok(
+    requests.some((request) => request.body.includes("Unknown tool")),
+    "the model must receive Unknown tool, proving github_list_prs was never registered",
+  );
 });
 
 test("github_list_prs is served from the operations cache on repeat calls and records evidence", async (t) => {
