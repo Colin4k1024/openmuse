@@ -13,7 +13,7 @@ import {
   nextRunAfter,
 } from "../apps/server/src/engine/digest.ts";
 import { GitHubAuth } from "../apps/server/src/github-auth.ts";
-import { type GhRunner, GitHubAdapter, GitHubError } from "../packages/integrations/src/github.ts";
+import { type GhRunner, GitHubError } from "../packages/integrations/src/github.ts";
 
 const REPO = "owner/repo";
 
