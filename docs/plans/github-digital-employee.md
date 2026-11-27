@@ -34,15 +34,17 @@
 
 ### 1.1 已核实的事实（代码级）
 
+> 行号以 main `f593317` 为基准。
+
 | 事实 | 证据 |
 | --- | --- |
 | 任务状态机有 9 态：`queued/running/waiting_approval/waiting_input/scheduled/paused/succeeded/failed/cancelled` | `packages/domain/src/agent.ts:3-12` |
-| 任务 worker 用 SQL lease（默认 60s 见 `:119`，心跳 leaseMs/3 见 `:186`），lease 过期任务可被恢复；`waiting_approval` 不被重复 claim | `apps/server/src/engine/worker.ts:67-128,171-187` |
-| 审批服务 ActionService：proposal 带 hash，过期/变更返回 409；approve 前检查连接有效性（`connected()`） | `apps/server/src/actions.ts:106-138` |
-| 模型任务工具骨架：`defineTool` + 串行队列 + `operations` sha256 幂等缓存 + checkpoint + `ctx.guard()` | `apps/server/src/engine/model.ts:39-93` |
+| 任务 worker 用 SQL lease（默认 60s 见 `:127`，心跳 leaseMs/3 见 `:189`），lease 过期任务可被恢复；`waiting_approval` 不被重复 claim（`:91-110`） | `apps/server/src/engine/worker.ts:87-136,184-190` |
+| 审批服务 ActionService：proposal 带 hash，过期/变更返回 409；approve 前检查连接有效性（`connected()`，`:136`） | `apps/server/src/actions.ts:102-138` |
+| 模型任务工具骨架：`defineTool` + 串行队列 + `operations` sha256 幂等缓存 + checkpoint（`:43`）+ `ctx.guard()`（`defineTool` 于 `:63`，`serial` 于 `:48`，`cached` 于 `:86`） | `apps/server/src/engine/model.ts:43-95` |
 | 密钥信封：AES-256-GCM versioned envelope（`v1.nonce.tag.ct`） | `packages/integrations/src/vault.ts` |
-| 本地 LLM 通路已存在：`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` | `apps/server/src/engine/tanstack-agent.ts:28,34` |
-| **CopilotKit Intelligence 在所有模式强制要求**（线程持久化上云） | `apps/server/src/config.ts:79` |
+| 本地 LLM 通路已存在：`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` | `apps/server/src/engine/tanstack-agent.ts:38,48` |
+| **CopilotKit Intelligence 在所有模式强制要求**（线程持久化上云） | `apps/server/src/config.ts:169` |
 | Google 集成是现成的适配器范式（816 行，OAuth + 加密存储 + reviewed 写入） | `packages/integrations/src/google.ts` |
 | `Evidence.kind` 仅 `mail/file/web/user`，无 `github` | `packages/domain/src/agent.ts:15` |
 | 测试基建：`tests/` 下 21 个测试文件（全仓含 mobile/worker/computer 共 28 个），含 provider 契约测试模式（`tests/google.test.ts`、`tests/openbot.test.ts`） | `tests/` |
@@ -187,12 +189,12 @@
 ### Issue #8 [Infra] 本地线程存储（去 CPK 云依赖）
 
 - **目标**：使 `CPK_INTELLIGENCE_API_KEY` 可选，提供 PGlite 本地线程持久化，实现"对话不出本机"
-- **范围**：抽象 `CopilotKitIntelligence` 注入点（`apps/server/src/agent.ts:31`）为接口 + PGlite 实现；对齐上游 #73（Intelligence 可选化）与 #179（keyless local thread store）——**优先跟踪/复用上游方案，不重复造轮子**；`config.ts` 改为按模式要求 key
+- **范围**：抽象 `CopilotKitIntelligence` 注入点（`apps/server/src/agent.ts:32`）为接口 + PGlite 实现；对齐上游 #73（Intelligence 可选化）与 #179（keyless local thread store）——**优先跟踪/复用上游方案，不重复造轮子**；`config.ts` 改为按模式要求 key
 - **非目标**：自建 `useThreads` 协议全量兼容层（仅覆盖本 fork 用到的能力）；迁移已有云端线程
 - **依赖**：无代码依赖；建议等 #1 评审确认隐私目标后启动
 - **回滚**：`THREADS_BACKEND=intelligence|local` 配置切换
 - **验收标准**：
-  1. `THREADS_BACKEND=local` 且无 CPK key 时服务正常启动（当前 `config.ts:79` 会拒绝）
+  1. `THREADS_BACKEND=local` 且无 CPK key 时服务正常启动（当前 `config.ts:169` 会拒绝）
   2. 线程创建/重命名/归档/回放全流程本地持久化，重启不丢
   3. 出网审计：local 模式下无 intelligence 域名请求
   4. 与上游 #73/#179 的关系在文档中写明（复用/分叉/临时方案）
@@ -202,7 +204,7 @@
 ## 3. 核心验收逻辑（跨 Issue 共用）
 
 ### 3.1 状态机不变量
-- `waiting_approval` 任务不被 worker claim 执行（`worker.ts:82-106` 现有语义，新增 GitHub 测试锁定）
+- `waiting_approval` 任务不被 worker claim 执行（`worker.ts:91-110` 现有语义，新增 GitHub 测试锁定）
 - 写操作 proposal：`awaiting_review → executing → succeeded|failed`，禁止 `executing → awaiting_review` 回退（对齐上游已修复的 #36 回归语义）
 - 任何终态（succeeded/failed/cancelled）任务不再产生外部请求
 
