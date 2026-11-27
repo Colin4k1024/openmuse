@@ -217,7 +217,7 @@ test("reconnecting expires the previous connection's pending proposals", async (
   assert.equal((await auth.connection("u-re"))?.id, second.id);
 });
 
-test("concurrent connects leave exactly one connection; old proposals expire", async () => {
+test("concurrent connects leave exactly one stored connection", async () => {
   const { fetch } = patFetch(() => okUser());
   const auth = new GitHubAuth(db, config(), { fetch });
   const [a, b] = await Promise.all([
@@ -230,6 +230,22 @@ test("concurrent connects leave exactly one connection; old proposals expire", a
     final.id === a.id || final.id === b.id,
     "the stored connection is one of the two contenders",
   );
+});
+
+test("status probe degrades to unavailable (not 500) when GitHub is unreachable", async () => {
+  let down = false;
+  const { fetch } = patFetch(() => {
+    if (down) throw new TypeError("fetch failed: ECONNREFUSED");
+    return okUser();
+  });
+  const auth = new GitHubAuth(db, config(), { fetch });
+  await auth.connectWithToken("u-down", TOKEN);
+  down = true;
+  const probe = await auth.probe("u-down");
+  assert.equal(probe.state, "unavailable");
+  if (probe.state === "unavailable") assert.match(probe.detail, /unreachable/);
+  // The credential must survive: a network outage is not a revocation.
+  assert.equal(await auth.connected("u-down"), true);
 });
 
 test("gh-cli probe distinguishes not-installed from not-authenticated", async () => {
@@ -289,6 +305,12 @@ test("config parses GitHub settings and enforces mode rules", async () => {
     assert.equal(parsed.githubApiHost, "https://api.github.com");
 
     process.env.GITHUB_API_HOST = "http://insecure.example";
+    assert.throws(() => readConfig(), /GITHUB_API_HOST/);
+    process.env.GITHUB_API_HOST = "https://";
+    assert.throws(() => readConfig(), /GITHUB_API_HOST/);
+    process.env.GITHUB_API_HOST = "https://foo bar";
+    assert.throws(() => readConfig(), /GITHUB_API_HOST/);
+    process.env.GITHUB_API_HOST = "https://api.github.com/#frag";
     assert.throws(() => readConfig(), /GITHUB_API_HOST/);
     process.env.GITHUB_API_HOST = "";
 

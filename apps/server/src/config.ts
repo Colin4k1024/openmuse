@@ -164,14 +164,22 @@ export function readConfig(): Config {
     /\/+$/,
     "",
   );
+  const githubApiHostError = "GITHUB_API_HOST must be a plain https://host[:port] URL";
+  let parsedGithubHost: URL;
+  try {
+    parsedGithubHost = new URL(githubApiHost);
+  } catch {
+    throw new Error(githubApiHostError);
+  }
   if (
-    !githubApiHost.startsWith("https://") ||
-    new URL(githubApiHost).pathname !== "/" ||
-    new URL(githubApiHost).search ||
-    new URL(githubApiHost).username ||
-    new URL(githubApiHost).password
+    parsedGithubHost.protocol !== "https:" ||
+    parsedGithubHost.pathname !== "/" ||
+    parsedGithubHost.search ||
+    parsedGithubHost.hash ||
+    parsedGithubHost.username ||
+    parsedGithubHost.password
   )
-    throw new Error("GITHUB_API_HOST must be a plain https://host[:port] URL");
+    throw new Error(githubApiHostError);
   if (process.env.GITHUB_WRITE_ENABLED === "true" && process.env.GITHUB_ENABLED !== "true")
     throw new Error("GITHUB_WRITE_ENABLED requires GITHUB_ENABLED=true");
   if (process.env.GITHUB_ENABLED === "true" && githubAuthMode === "pat") {

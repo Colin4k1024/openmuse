@@ -119,7 +119,16 @@ export class GitHubAuth {
   > {
     if (!this.configured()) return { state: "disabled" };
     if (this.config.githubAuthMode === "pat") {
-      const connection = await this.validate(owner);
+      let connection: GitHubConnectionInfo | null;
+      try {
+        connection = await this.validate(owner);
+      } catch (error) {
+        // A network failure is not a revoked token: never invalidate, degrade to unavailable.
+        return {
+          state: "unavailable",
+          detail: `GitHub is unreachable: ${error instanceof Error ? error.message : "unknown error"}`,
+        };
+      }
       return connection
         ? { state: "connected", connection }
         : { state: "unavailable", detail: "No valid stored token. Connect a fine-grained PAT." };
@@ -259,6 +268,7 @@ export class GitHubAuth {
   /**
    * Clear the credential and expire its pending work, but only when the stored
    * row still matches what the caller observed (no TOCTOU against reconnects).
+   * Used by the write path (#6) when GitHub answers 401 mid-execution.
    */
   async invalidate(owner: string, connectionId?: string): Promise<void> {
     const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
