@@ -79,9 +79,7 @@ async function digestServer(t: TestContext, runner: GhRunner) {
   const db = await createStore();
   t.after(() => db.close());
   const cfg = config(directory);
-  const auth = new GitHubAuth(db, cfg, {
-    adapter: new GitHubAdapter({ enabled: true, allowedRepos: [REPO], runner }),
-  });
+  const auth = new GitHubAuth(db, cfg, { runner });
   const server = await createApp(db, cfg, { github: auth });
   const owner = "digest-owner";
   await server.workspace.ensureSample(owner, server.actions);

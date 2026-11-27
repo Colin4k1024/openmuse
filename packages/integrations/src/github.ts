@@ -42,12 +42,19 @@ export type GhRunner = (args: string[]) => Promise<GhResult>;
 export interface GitHubAdapterOptions {
   /** Defaults to false: a disabled adapter rejects every call without spawning. */
   enabled?: boolean;
+  /**
+   * Defaults to false: write methods reject without spawning. Writes exist to
+   * execute human-approved proposals only (GITHUB_WRITE_ENABLED).
+   */
+  writeEnabled?: boolean;
   /** "owner/repo" entries. Empty (or omitted) denies every repository, including reads. */
   allowedRepos?: readonly string[];
   /** Test seam; defaults to spawning `gh`. */
   runner?: GhRunner;
   /** Executable used by the default runner. */
   ghPath?: string;
+  /** Extra environment for the spawned gh process (e.g. GH_TOKEN in pat mode). */
+  env?: Record<string, string>;
 }
 
 const authorSchema = z.object({ login: z.string() }).nullable();
@@ -162,13 +169,13 @@ export function truncateUtf8(text: string, maxBytes: number): string {
 }
 
 /** Default runner: spawn `gh` without a shell; rejections keep stdout/stderr. */
-function createGhRunner(ghPath: string): GhRunner {
+function createGhRunner(ghPath: string, env?: Record<string, string>): GhRunner {
   return (args) =>
     new Promise<GhResult>((resolve, reject) => {
       execFile(
         ghPath,
         args,
-        { maxBuffer: MAX_BUFFER, env: process.env },
+        { maxBuffer: MAX_BUFFER, env: { ...process.env, ...env } },
         (error, stdout, stderr) => {
           if (!error) return resolve({ stdout, stderr });
           const system = error as NodeJS.ErrnoException & { code: string | number };
@@ -199,13 +206,15 @@ function createGhRunner(ghPath: string): GhRunner {
 
 export class GitHubAdapter {
   private readonly enabled: boolean;
+  private readonly writeEnabled: boolean;
   private readonly allowlist: ReadonlySet<string>;
   private readonly run: GhRunner;
 
   constructor(options: GitHubAdapterOptions = {}) {
     this.enabled = options.enabled ?? false;
+    this.writeEnabled = options.writeEnabled ?? false;
     this.allowlist = new Set((options.allowedRepos ?? []).map((repo) => repo.trim().toLowerCase()));
-    this.run = options.runner ?? createGhRunner(options.ghPath ?? "gh");
+    this.run = options.runner ?? createGhRunner(options.ghPath ?? "gh", options.env);
   }
 
   private assertEnabled(): void {
@@ -366,5 +375,234 @@ export class GitHubAdapter {
       "--json",
       SEARCH_CODE_FIELDS,
     ]);
+  }
+
+  // ---- Write surface: every method requires writeEnabled and exists to
+  // execute human-approved proposals (docs/GITHUB-INTEGRATION.md). ----
+
+  private authorizeWrite(repo: string): string {
+    const target = this.authorize(repo);
+    if (!this.writeEnabled)
+      throw new GitHubError("disabled", "GitHub writes are disabled (GITHUB_WRITE_ENABLED=false).");
+    return target;
+  }
+
+  /** The head SHA of a branch, or null when it does not exist. */
+  async getBranchSha(repo: string, branch: string): Promise<string | null> {
+    const target = this.authorize(repo);
+    try {
+      const ref = await this.json(z.object({ object: z.object({ sha: z.string() }) }), [
+        "api",
+        `repos/${target}/git/ref/heads/${branch}`,
+      ]);
+      return ref.object.sha;
+    } catch (error) {
+      if (error instanceof GitHubError && error.code === "not_found") return null;
+      throw error;
+    }
+  }
+
+  /** Create a branch at fromSha; an existing branch at the same SHA is a success. */
+  async createBranch(
+    repo: string,
+    branch: string,
+    fromSha: string,
+  ): Promise<{ sha: string; created: boolean }> {
+    const target = this.authorizeWrite(repo);
+    const existing = await this.getBranchSha(target, branch);
+    if (existing) {
+      if (existing.toLowerCase() === fromSha.toLowerCase())
+        return { sha: existing, created: false };
+      throw new GitHubError(
+        "api",
+        `Branch ${branch} already exists at ${existing.slice(0, 12)}, not ${fromSha.slice(0, 12)}.`,
+      );
+    }
+    await this.json(z.looseObject({ ref: z.string() }), [
+      "api",
+      "-X",
+      "POST",
+      `repos/${target}/git/refs`,
+      "-f",
+      `ref=refs/heads/${branch}`,
+      "-f",
+      `sha=${fromSha}`,
+    ]);
+    return { sha: fromSha, created: true };
+  }
+
+  /** One commit containing all file changes, via the git trees API. */
+  async commitFiles(
+    repo: string,
+    branch: string,
+    message: string,
+    files: { path: string; content: string }[],
+  ): Promise<{ sha: string }> {
+    const target = this.authorizeWrite(repo);
+    const base = await this.getBranchSha(target, branch);
+    if (!base) throw new GitHubError("not_found", `Branch ${branch} does not exist in ${target}.`);
+    const treeArgs = ["api", "-X", "POST", `repos/${target}/git/trees`, "-f", `base_tree=${base}`];
+    for (const file of files) {
+      treeArgs.push(
+        "-f",
+        `tree[][path]=${file.path}`,
+        "-f",
+        "tree[][mode]=100644",
+        "-f",
+        "tree[][type]=blob",
+        "-f",
+        `tree[][content]=${file.content}`,
+      );
+    }
+    const tree = await this.json(z.object({ sha: z.string() }), treeArgs);
+    const commit = await this.json(z.object({ sha: z.string() }), [
+      "api",
+      "-X",
+      "POST",
+      `repos/${target}/git/commits`,
+      "-f",
+      `message=${message}`,
+      "-f",
+      `tree=${tree.sha}`,
+      "-f",
+      `parents[]=${base}`,
+    ]);
+    // The ref update is idempotent (same target SHA), so retrying it once after a
+    // transport hiccup cannot create a second commit or move the branch twice.
+    try {
+      await this.json(z.looseObject({ ref: z.string() }), [
+        "api",
+        "-X",
+        "PATCH",
+        `repos/${target}/git/refs/heads/${branch}`,
+        "-f",
+        `sha=${commit.sha}`,
+      ]);
+    } catch (error) {
+      if (error instanceof GitHubError && error.code === "api") {
+        await this.json(z.looseObject({ ref: z.string() }), [
+          "api",
+          "-X",
+          "PATCH",
+          `repos/${target}/git/refs/heads/${branch}`,
+          "-f",
+          `sha=${commit.sha}`,
+        ]);
+      } else throw error;
+    }
+    return { sha: commit.sha };
+  }
+
+  /** The open PR for a head branch, or null. */
+  async findOpenPrByHead(
+    repo: string,
+    head: string,
+  ): Promise<{ number: number; url: string; title: string } | null> {
+    const target = this.authorize(repo);
+    const prs = await this.json(
+      z.array(z.object({ number: z.number().int(), url: z.string(), title: z.string() })),
+      [
+        "pr",
+        "list",
+        "--repo",
+        target,
+        "--head",
+        head,
+        "--state",
+        "open",
+        "--limit",
+        "1",
+        "--json",
+        "number,url,title",
+      ],
+    );
+    return prs[0] ?? null;
+  }
+
+  /** Open a PR; an existing open PR from the same head is returned instead of a duplicate. */
+  async createPullRequest(
+    repo: string,
+    head: string,
+    base: string,
+    title: string,
+    body: string,
+  ): Promise<{ number: number; url: string; created: boolean }> {
+    const target = this.authorizeWrite(repo);
+    const existing = await this.findOpenPrByHead(target, head);
+    if (existing) return { ...existing, created: false };
+    try {
+      await this.run([
+        "pr",
+        "create",
+        "--repo",
+        target,
+        "--head",
+        head,
+        "--base",
+        base,
+        "--title",
+        title,
+        "--body",
+        body,
+      ]);
+    } catch (error) {
+      // A racing creator turns into the existing PR, never a duplicate.
+      if (error instanceof GitHubError && error.message.toLowerCase().includes("already exists")) {
+        const raced = await this.findOpenPrByHead(target, head);
+        if (raced) return { ...raced, created: false };
+      }
+      throw error;
+    }
+    const created = await this.findOpenPrByHead(target, head);
+    if (!created)
+      throw new GitHubError(
+        "api",
+        "gh pr create reported success but no open PR was found for the head branch.",
+      );
+    return { ...created, created: true };
+  }
+
+  /** Find a comment carrying an idempotency marker. */
+  async findCommentByMarker(
+    repo: string,
+    number: number,
+    marker: string,
+  ): Promise<{ id: number; url: string } | null> {
+    const target = this.authorize(repo);
+    const pages = await this.json(
+      z.array(z.array(z.object({ id: z.number(), body: z.string(), html_url: z.string() }))),
+      [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${target}/issues/${positiveInt(number, "Issue number")}/comments`,
+      ],
+    );
+    for (const page of pages)
+      for (const comment of page)
+        if (comment.body.includes(marker)) return { id: comment.id, url: comment.html_url };
+    return null;
+  }
+
+  /** Post a comment with an idempotency marker; a marker hit returns the existing comment. */
+  async addComment(
+    repo: string,
+    number: number,
+    body: string,
+    idemKey: string,
+  ): Promise<{ url: string; created: boolean }> {
+    const target = this.authorizeWrite(repo);
+    const marker = `<!-- openmuse:idem:${idemKey} -->`;
+    const existing = await this.findCommentByMarker(target, number, marker);
+    if (existing) return { url: existing.url, created: false };
+    const posted = await this.json(z.object({ html_url: z.string() }), [
+      "api",
+      "-X",
+      "POST",
+      `repos/${target}/issues/${positiveInt(number, "Issue number")}/comments`,
+      "-f",
+      `body=${body}\n\n${marker}`,
+    ]);
+    return { url: posted.html_url, created: true };
   }
 }

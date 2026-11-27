@@ -7,8 +7,8 @@ import type {
   BrowserSession,
   CalendarEvent,
   Mail,
-  ProposalInput,
   Workspace,
+  WorkspaceProposalInput,
 } from "../../../packages/domain/src/index.ts";
 import { GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
@@ -389,7 +389,7 @@ export class WorkspaceService {
       files,
     };
   }
-  async prepare(owner: string, input: ProposalInput, connectionId?: string) {
+  async prepare(owner: string, input: WorkspaceProposalInput, connectionId?: string) {
     if (input.kind === "email.send") {
       for (const id of input.data.attachmentIds) await this.files.get(owner, id);
       return { input };
@@ -410,7 +410,7 @@ export class WorkspaceService {
   }
   async execute(
     owner: string,
-    input: ProposalInput,
+    input: WorkspaceProposalInput,
     connectionId?: string,
     targetVersion?: string,
   ): Promise<string> {
