@@ -64,7 +64,11 @@ test("a loopback OpenAI-compatible endpoint drives the full task loop with tool 
 
 test("an unreachable local endpoint fails the task with a readable, retryable error", async (t) => {
   const base = process.env.OPENAI_BASE_URL;
+  const key = process.env.OPENAI_API_KEY;
   process.env.OPENAI_BASE_URL = "http://127.0.0.1:1/v1"; // nothing listens here
+  // A placeholder key is required for the failure to come from the endpoint,
+  // not from missing credentials.
+  process.env.OPENAI_API_KEY = "test-placeholder";
   const directory = await mkdtemp(join(tmpdir(), "openfuse-local-down-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const db = await createStore();
@@ -78,11 +82,18 @@ test("an unreachable local endpoint fails the task with a readable, retryable er
     const saved = await server.agent.getTask(owner, task.id);
     assert.equal(saved.status, "failed");
     assert.ok(saved.error && saved.error.length > 0, "an error message is recorded");
+    assert.doesNotMatch(
+      saved.error ?? "",
+      /OPENAI_API_KEY is not set/,
+      "the failure must come from the endpoint, not missing credentials",
+    );
     // The task is retryable: a recovered endpoint can continue the work.
     const retried = await server.agent.control(owner, task.id, "retry");
     assert.equal(retried.status, "queued");
   } finally {
     if (base === undefined) delete process.env.OPENAI_BASE_URL;
     else process.env.OPENAI_BASE_URL = base;
+    if (key === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = key;
   }
 });
