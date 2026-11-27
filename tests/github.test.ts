@@ -143,7 +143,26 @@ test("searchCode rejects empty queries before spawning", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("classifies gh failures: auth, rate limit, not found, generic api", async () => {
+// Drive the real default runner + classifier through a fake gh binary whose
+// stderr/exit come from files, so every mapping is exercised end to end.
+async function fakeBinary(dir: string, files: { stderr?: string; stdout?: string; exit?: number }) {
+  const log = join(dir, "argv.log");
+  const fake = join(dir, "gh");
+  await writeFile(join(dir, "stderr.txt"), files.stderr ?? "");
+  await writeFile(join(dir, "stdout.txt"), files.stdout ?? "");
+  await writeFile(join(dir, "exit.txt"), String(files.exit ?? 0));
+  await writeFile(
+    fake,
+    `#!/bin/sh\ndir=$(dirname "$0")\necho "$@" >> "${log}"\ncat "$dir/stdout.txt"\ncat "$dir/stderr.txt" >&2\nexit $(cat "$dir/exit.txt")\n`,
+  );
+  await chmod(fake, 0o755);
+  return { fake, log };
+}
+
+test("default runner classifies real subprocess failures end to end", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-gh-classify-"));
+  const { fake } = await fakeBinary(dir, {});
+  const adapter = new GitHubAdapter({ enabled: true, allowedRepos: [REPO], ghPath: fake });
   const cases: [string, string][] = [
     ["gh auth login: not logged in to github.com", "auth_failed"],
     ["HTTP 401: Bad credentials", "auth_failed"],
@@ -152,18 +171,8 @@ test("classifies gh failures: auth, rate limit, not found, generic api", async (
     ["something exploded", "api"],
   ];
   for (const [stderr, code] of cases) {
-    const { adapter } = fixture(() => {
-      throw new GitHubError(
-        ((): "auth_failed" | "rate_limited" | "not_found" | "api" => {
-          const text = stderr.toLowerCase();
-          if (text.includes("rate limit")) return "rate_limited";
-          if (text.includes("not logged in") || text.includes("401")) return "auth_failed";
-          if (text.includes("404") || text.includes("could not resolve")) return "not_found";
-          return "api";
-        })(),
-        stderr,
-      );
-    });
+    await writeFile(join(dir, "stderr.txt"), stderr);
+    await writeFile(join(dir, "exit.txt"), "1");
     await assert.rejects(adapter.listPullRequests(REPO), { code });
   }
 });
@@ -179,13 +188,10 @@ test("default runner maps ENOENT to gh_missing", async () => {
 
 test("default runner classifies stderr from a failing fake gh binary", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openmuse-gh-fake-"));
-  const log = join(dir, "argv.log");
-  const fake = join(dir, "gh");
-  await writeFile(
-    fake,
-    `#!/bin/sh\necho "$@" >> "${log}"\necho "HTTP 401: Bad credentials (token ghp_secretvalue123)" >&2\nexit 1\n`,
-  );
-  await chmod(fake, 0o755);
+  const { fake, log } = await fakeBinary(dir, {
+    stderr: "HTTP 401: Bad credentials (token ghp_secretvalue123)",
+    exit: 1,
+  });
   const adapter = new GitHubAdapter({ enabled: true, allowedRepos: [REPO], ghPath: fake });
   await assert.rejects(adapter.listPullRequests(REPO), (error: unknown) => {
     assert.ok(error instanceof GitHubError);
@@ -195,6 +201,59 @@ test("default runner classifies stderr from a failing fake gh binary", async () 
   });
   const recorded = await readFile(log, "utf8");
   assert.match(recorded, /pr list --repo owner\/repo/);
+});
+
+test("searchCode rejects flag injection and scope qualifiers before spawning", async () => {
+  const { calls, adapter } = fixture({ stdout: "[]" });
+  await assert.rejects(adapter.searchCode(REPO, "--owner=evil"), { code: "repo_not_allowed" });
+  await assert.rejects(adapter.searchCode(REPO, "--web"), { code: "repo_not_allowed" });
+  await assert.rejects(adapter.searchCode(REPO, "foo repo:other/repo"), {
+    code: "repo_not_allowed",
+  });
+  await assert.rejects(adapter.searchCode(REPO, "foo owner:evil"), { code: "repo_not_allowed" });
+  await adapter.searchCode(REPO, "foo in:path");
+  assert.equal(calls.length, 1, "only the legitimate query spawns");
+  assert.ok(calls[0].includes("--"), "query is protected by a flag terminator");
+});
+
+test("allowlist entries are trimmed so config whitespace still matches", async () => {
+  const adapter = new GitHubAdapter({
+    enabled: true,
+    allowedRepos: ["  Owner/Repo  "],
+    runner: async () => ({ stdout: "[]", stderr: "" }),
+  });
+  await adapter.listIssues("owner/repo");
+});
+
+test("non-finite or invalid numbers are rejected, not stringified", async () => {
+  const { calls, adapter } = fixture({ stdout: "[]" });
+  await assert.rejects(adapter.getPullRequest(REPO, Number.NaN), { code: "api" });
+  await assert.rejects(adapter.getPullRequest(REPO, 0), { code: "api" });
+  await assert.rejects(adapter.getChecksStatus(REPO, Number.POSITIVE_INFINITY), { code: "api" });
+  await adapter.listIssues(REPO, { limit: Number.NaN });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][calls[0].indexOf("--limit") + 1], "30", "NaN limit falls back to default");
+});
+
+test("truncateUtf8 never splits a code point and respects the byte budget", async () => {
+  const { truncateUtf8, MAX_DIFF_BYTES } = await import("../packages/integrations/src/github.ts");
+  const text = "abc".repeat(100) + "中文汉" + "xyz".repeat(100);
+  const budget = Buffer.byteLength(text, "utf8") - 2; // cut inside the final run
+  const clipped = truncateUtf8(text, budget);
+  assert.ok(Buffer.byteLength(clipped, "utf8") <= budget);
+  assert.equal(clipped.includes("\uFFFD"), false);
+  assert.equal(truncateUtf8("short", 100), "short");
+  const big = "\u4e2d".repeat(MAX_DIFF_BYTES); // 3 bytes each, forces mid-codepoint cuts
+  const clippedBig = truncateUtf8(big, MAX_DIFF_BYTES);
+  assert.ok(Buffer.byteLength(clippedBig, "utf8") <= MAX_DIFF_BYTES);
+});
+
+test("diff truncation marks output and survives a maxBuffer-killed child", async () => {
+  const { adapter } = fixture({ stdout: "x".repeat(2 * 1024 * 1024) });
+  const { diff, truncated } = await adapter.getPullRequestDiff(REPO, 7);
+  assert.equal(truncated, true);
+  assert.ok(Buffer.byteLength(diff, "utf8") <= 1024 * 1024 + 64);
+  assert.match(diff, /openmuse:diff-truncated/);
 });
 
 test("sanitizeGhOutput redacts every token shape", () => {

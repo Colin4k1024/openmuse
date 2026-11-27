@@ -135,8 +135,24 @@ function classifyGhError(stderr: string): GitHubErrorCode {
 }
 
 function limit(value: number | undefined): string {
-  const parsed = Math.trunc(value ?? DEFAULT_LIMIT);
+  const parsed = value !== undefined && Number.isFinite(value) ? Math.trunc(value) : DEFAULT_LIMIT;
   return String(Math.min(Math.max(parsed, 1), MAX_LIMIT));
+}
+
+function positiveInt(value: number, label: string): string {
+  if (!Number.isFinite(value) || Math.trunc(value) < 1)
+    throw new GitHubError("api", `${label} must be a positive integer, got ${value}.`);
+  return String(Math.trunc(value));
+}
+
+/** Truncate to at most maxBytes of UTF-8 without splitting a code point. */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, "utf8");
+  if (buffer.byteLength <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (buffer[end] & 0b1100_0000) === 0b1000_0000) end -= 1;
+  if (end > 0 && (buffer[end] & 0b1000_0000) !== 0) end -= 1;
+  return buffer.subarray(0, end).toString("utf8");
 }
 
 /** Default runner: spawn `gh` without a shell; rejections keep stdout/stderr. */
@@ -158,6 +174,11 @@ function createGhRunner(ghPath: string): GhRunner {
               ),
             );
           }
+          // Oversize output kills the child; keep the partial stdout so callers
+          // (diff truncation, JSON validation) degrade predictably instead of
+          // surfacing an 8MiB error message.
+          if ((system.code as string) === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+            return resolve({ stdout, stderr });
           const detail = sanitizeGhOutput(stderr || stdout || String(error));
           reject(
             new GitHubError(
@@ -177,7 +198,7 @@ export class GitHubAdapter {
 
   constructor(options: GitHubAdapterOptions = {}) {
     this.enabled = options.enabled ?? false;
-    this.allowlist = new Set((options.allowedRepos ?? []).map((repo) => repo.toLowerCase()));
+    this.allowlist = new Set((options.allowedRepos ?? []).map((repo) => repo.trim().toLowerCase()));
     this.run = options.runner ?? createGhRunner(options.ghPath ?? "gh");
   }
 
@@ -240,7 +261,7 @@ export class GitHubAdapter {
     return this.json(gitHubPullRequestDetailSchema, [
       "pr",
       "view",
-      String(Math.trunc(number)),
+      positiveInt(number, "Pull request number"),
       "--repo",
       target,
       "--json",
@@ -254,11 +275,19 @@ export class GitHubAdapter {
     number: number,
   ): Promise<{ diff: string; truncated: boolean }> {
     const target = this.authorize(repo);
-    const { stdout } = await this.run(["pr", "diff", String(Math.trunc(number)), "--repo", target]);
+    const { stdout } = await this.run([
+      "pr",
+      "diff",
+      positiveInt(number, "Pull request number"),
+      "--repo",
+      target,
+    ]);
     if (Buffer.byteLength(stdout, "utf8") <= MAX_DIFF_BYTES)
       return { diff: stdout, truncated: false };
-    const clipped = stdout.slice(0, MAX_DIFF_BYTES);
-    return { diff: `${clipped}\n<!-- openmuse:diff-truncated -->`, truncated: true };
+    return {
+      diff: `${truncateUtf8(stdout, MAX_DIFF_BYTES)}\n<!-- openmuse:diff-truncated -->`,
+      truncated: true,
+    };
   }
 
   async listIssues(
@@ -285,7 +314,7 @@ export class GitHubAdapter {
     return this.json(z.array(gitHubCheckSchema), [
       "pr",
       "checks",
-      String(Math.trunc(prNumber)),
+      positiveInt(prNumber, "Pull request number"),
       "--repo",
       target,
       "--json",
@@ -299,11 +328,21 @@ export class GitHubAdapter {
     options: { limit?: number } = {},
   ): Promise<GitHubCodeResult[]> {
     const target = this.authorize(repo);
-    if (!query.trim()) throw new GitHubError("api", "Code search requires a non-empty query.");
+    const trimmed = query.trim();
+    if (!trimmed) throw new GitHubError("api", "Code search requires a non-empty query.");
+    // The query is a single positional argument, but cobra still parses leading
+    // dashes as flags and GitHub search treats repeated repo:/owner: qualifiers
+    // as OR — both would silently escape the allowlist. Reject them outright.
+    if (trimmed.startsWith("-") || /\b(repo|owner|org|user):/i.test(trimmed))
+      throw new GitHubError(
+        "repo_not_allowed",
+        "Code search queries cannot contain flags or repo:/owner: qualifiers; the allowlisted repository is always appended.",
+      );
     return this.json(z.array(gitHubCodeResultSchema), [
       "search",
       "code",
-      `${query.trim()} repo:${target}`,
+      "--",
+      `${trimmed} repo:${target}`,
       "--limit",
       limit(options.limit),
       "--json",
