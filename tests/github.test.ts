@@ -213,7 +213,10 @@ test("searchCode rejects flag injection and scope qualifiers before spawning", a
   await assert.rejects(adapter.searchCode(REPO, "foo owner:evil"), { code: "repo_not_allowed" });
   await adapter.searchCode(REPO, "foo in:path");
   assert.equal(calls.length, 1, "only the legitimate query spawns");
-  assert.ok(calls[0].includes("--"), "query is protected by a flag terminator");
+  const args = calls[0];
+  assert.equal(args.includes("--"), false, "gh folds post--- args into the query; do not emit it");
+  const query = args[args.indexOf("code") + 1];
+  assert.equal(query, "foo in:path repo:owner/repo");
 });
 
 test("allowlist entries are trimmed so config whitespace still matches", async () => {
@@ -243,6 +246,12 @@ test("truncateUtf8 never splits a code point and respects the byte budget", asyn
   assert.ok(Buffer.byteLength(clipped, "utf8") <= budget);
   assert.equal(clipped.includes("\uFFFD"), false);
   assert.equal(truncateUtf8("short", 100), "short");
+  // Reviewer repro cases: exact lead-byte boundaries and mid-sequence cuts.
+  assert.equal(truncateUtf8("éé", 2), "é");
+  assert.equal(truncateUtf8("中文", 3), "中");
+  assert.equal(truncateUtf8("a中文", 4), "a中");
+  assert.equal(truncateUtf8("中文", 4), "中");
+  assert.equal(truncateUtf8("é", 1), "");
   const big = "\u4e2d".repeat(MAX_DIFF_BYTES); // 3 bytes each, forces mid-codepoint cuts
   const clippedBig = truncateUtf8(big, MAX_DIFF_BYTES);
   assert.ok(Buffer.byteLength(clippedBig, "utf8") <= MAX_DIFF_BYTES);
@@ -254,6 +263,18 @@ test("diff truncation marks output and survives a maxBuffer-killed child", async
   assert.equal(truncated, true);
   assert.ok(Buffer.byteLength(diff, "utf8") <= 1024 * 1024 + 64);
   assert.match(diff, /openmuse:diff-truncated/);
+});
+
+test("real maxBuffer kill (>8MiB stdout) still yields a truncated diff", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-gh-big-"));
+  const { fake } = await fakeBinary(dir, {});
+  // Emit 9MiB of stdout, exceeding the default runner's 8MiB maxBuffer.
+  await writeFile(fake, `#!/bin/sh\nnode -e "process.stdout.write('y'.repeat(9 * 1024 * 1024))"\n`);
+  await chmod(fake, 0o755);
+  const adapter = new GitHubAdapter({ enabled: true, allowedRepos: [REPO], ghPath: fake });
+  const { diff, truncated } = await adapter.getPullRequestDiff(REPO, 7);
+  assert.equal(truncated, true);
+  assert.ok(Buffer.byteLength(diff, "utf8") <= 1024 * 1024 + 64);
 });
 
 test("sanitizeGhOutput redacts every token shape", () => {

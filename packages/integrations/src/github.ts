@@ -149,10 +149,16 @@ function positiveInt(value: number, label: string): string {
 export function truncateUtf8(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, "utf8");
   if (buffer.byteLength <= maxBytes) return text;
-  let end = maxBytes;
-  while (end > 0 && (buffer[end] & 0b1100_0000) === 0b1000_0000) end -= 1;
-  if (end > 0 && (buffer[end] & 0b1000_0000) !== 0) end -= 1;
-  return buffer.subarray(0, end).toString("utf8");
+  // Back off continuation bytes to the lead byte (or ASCII) at the cut.
+  let start = maxBytes;
+  while (start > 0 && (buffer[start] & 0b1100_0000) === 0b1000_0000) start -= 1;
+  const lead = buffer[start];
+  if (lead >= 0x80) {
+    const length = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+    // The character starting at `start` extends past the cut: drop it entirely.
+    if (start + length > maxBytes) return buffer.subarray(0, start).toString("utf8");
+  }
+  return buffer.subarray(0, maxBytes).toString("utf8");
 }
 
 /** Default runner: spawn `gh` without a shell; rejections keep stdout/stderr. */
@@ -178,7 +184,7 @@ function createGhRunner(ghPath: string): GhRunner {
           // (diff truncation, JSON validation) degrade predictably instead of
           // surfacing an 8MiB error message.
           if ((system.code as string) === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
-            return resolve({ stdout, stderr });
+            return resolve({ stdout, stderr: sanitizeGhOutput(stderr) });
           const detail = sanitizeGhOutput(stderr || stdout || String(error));
           reject(
             new GitHubError(
@@ -338,10 +344,12 @@ export class GitHubAdapter {
         "repo_not_allowed",
         "Code search queries cannot contain flags or repo:/owner: qualifiers; the allowlisted repository is always appended.",
       );
+    // No "--" terminator: gh (cobra) treats everything after it as positional,
+    // which would fold --limit/--json into the query. A single argv element with
+    // a rejected leading dash cannot be parsed as a flag, so it is unnecessary.
     return this.json(z.array(gitHubCodeResultSchema), [
       "search",
       "code",
-      "--",
       `${trimmed} repo:${target}`,
       "--limit",
       limit(options.limit),
