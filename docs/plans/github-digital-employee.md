@@ -41,7 +41,7 @@
 | 审批服务 ActionService：proposal 带 hash，过期/变更返回 409；approve 前检查连接有效性（`connected()`） | `apps/server/src/actions.ts:106-138` |
 | 模型任务工具骨架：`defineTool` + 串行队列 + `operations` sha256 幂等缓存 + checkpoint + `ctx.guard()` | `apps/server/src/engine/model.ts:39-93` |
 | 密钥信封：AES-256-GCM versioned envelope（`v1.nonce.tag.ct`） | `packages/integrations/src/vault.ts` |
-| 本地 LLM 通路已存在：`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` | `apps/server/src/engine/tanstack-agent.ts:29,34` |
+| 本地 LLM 通路已存在：`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` | `apps/server/src/engine/tanstack-agent.ts:28,34` |
 | **CopilotKit Intelligence 在所有模式强制要求**（线程持久化上云） | `apps/server/src/config.ts:79` |
 | Google 集成是现成的适配器范式（816 行，OAuth + 加密存储 + reviewed 写入） | `packages/integrations/src/google.ts` |
 | `Evidence.kind` 仅 `mail/file/web/user`，无 `github` | `packages/domain/src/agent.ts:15` |
