@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { GitHubAdapter } from "../../../packages/integrations/src/github.ts";
+import { GitHubAdapter, GitHubError } from "../../../packages/integrations/src/github.ts";
 import { decryptSecret, encryptSecret } from "../../../packages/integrations/src/vault.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
@@ -68,54 +68,85 @@ export class GitHubAuth {
     return this.config.githubEnabled === true;
   }
 
-  /** The active connection, or null. PAT records that cannot be decrypted raise a diagnosable 503. */
+  /** The active connection, or null. Never carries the token. Undecryptable PAT records raise a diagnosable 503. */
   async connection(owner: string): Promise<GitHubConnectionInfo | null> {
     if (!this.configured()) return null;
     if (this.config.githubAuthMode === "pat") {
       const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
       if (!stored?.secret) return null;
-      return { ...this.decode(stored.secret), mode: "pat", host: this.host() };
+      const { connectionId, account, scopes } = this.decode(stored.secret);
+      return { id: connectionId, account, scopes, mode: "pat", host: this.host() };
     }
-    try {
-      const user = await this.adapter.getAuthenticatedUser();
-      return {
-        id: "gh-cli",
-        account: user.login,
-        scopes: [],
-        mode: "gh-cli",
-        host: this.host(),
-      };
-    } catch {
-      return null;
-    }
+    const probe = await this.probeCli();
+    if (probe.state !== "connected") return null;
+    return { id: "gh-cli", account: probe.account, scopes: [], mode: "gh-cli", host: this.host() };
   }
 
   async connected(owner: string): Promise<boolean> {
     return (await this.connection(owner)) !== null;
   }
 
+  private async probeCli(): Promise<
+    { state: "connected"; account: string } | { state: "unavailable"; detail: string }
+  > {
+    try {
+      const user = await this.adapter.getAuthenticatedUser();
+      return { state: "connected", account: user.login };
+    } catch (error) {
+      const detail =
+        error instanceof GitHubError
+          ? error.code === "gh_missing"
+            ? "GitHub CLI is not installed on the server. Install gh, then run gh auth login."
+            : error.code === "auth_failed"
+              ? "gh is not authenticated. Run gh auth login on the server."
+              : `gh probe failed (${error.code}): ${error.message}`
+          : `gh probe failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      return { state: "unavailable", detail };
+    }
+  }
+
+  /**
+   * Operator-facing status. Distinguishes not-installed from not-authenticated,
+   * and re-validates a stored PAT (expiring it on 401) so status never reports
+   * a revoked token as connected.
+   */
+  async probe(
+    owner: string,
+  ): Promise<
+    | { state: "disabled" }
+    | { state: "unavailable"; detail: string }
+    | { state: "connected"; connection: GitHubConnectionInfo }
+  > {
+    if (!this.configured()) return { state: "disabled" };
+    if (this.config.githubAuthMode === "pat") {
+      const connection = await this.validate(owner);
+      return connection
+        ? { state: "connected", connection }
+        : { state: "unavailable", detail: "No valid stored token. Connect a fine-grained PAT." };
+    }
+    const cli = await this.probeCli();
+    if (cli.state !== "connected") return cli;
+    const connection = await this.connection(owner);
+    return connection
+      ? { state: "connected", connection }
+      : { state: "unavailable", detail: "gh probe failed" };
+  }
+
   private host(): string {
     return this.config.githubApiHost ?? "https://api.github.com";
   }
 
-  private decode(secret: string): Omit<GitHubConnectionInfo, "mode" | "host"> & { token: string } {
+  private decode(secret: string): StoredToken {
     if (!this.config.encryptionKey)
       throw new AppError("TOKEN_ENCRYPTION_KEY is not configured", 503);
-    let parsed: StoredToken;
     try {
-      parsed = JSON.parse(decryptSecret(secret, this.config.encryptionKey));
+      return JSON.parse(decryptSecret(secret, this.config.encryptionKey));
     } catch {
       throw new AppError(
         "Stored GitHub credential cannot be decrypted. Check TOKEN_ENCRYPTION_KEY, then reconnect.",
         503,
       );
     }
-    return {
-      id: parsed.connectionId,
-      account: parsed.account,
-      scopes: parsed.scopes,
-      token: parsed.token,
-    };
   }
 
   /** Validate and store a fine-grained PAT. Nothing is stored when GitHub rejects it. */
@@ -151,12 +182,25 @@ export class GitHubAuth {
     };
     if (!this.config.encryptionKey)
       throw new AppError("TOKEN_ENCRYPTION_KEY is not configured", 503);
+    let secret: string;
+    try {
+      secret = encryptSecret(JSON.stringify(stored), this.config.encryptionKey);
+    } catch (error) {
+      throw new AppError(
+        `GitHub credential could not be encrypted: ${error instanceof Error ? error.message : "unknown"}`,
+        503,
+      );
+    }
+    // Replacing a connection invalidates the old one: its pending proposals must
+    // not stay approvable for an account the server no longer controls.
+    const previous = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
+    if (previous?.connectionId) await this.expireProposals(owner, previous.connectionId);
     await this.db.put(owner, "credentials", {
       id: CREDENTIAL_ID,
       connectionId: stored.connectionId,
       account: stored.account,
       scopes: stored.scopes,
-      secret: encryptSecret(JSON.stringify(stored), this.config.encryptionKey),
+      secret,
     });
     return {
       id: stored.connectionId,
@@ -169,8 +213,10 @@ export class GitHubAuth {
 
   /**
    * Re-validate a stored PAT against GitHub. A 401 invalidates the connection:
-   * the credential is cleared and every connection-bound pending proposal is
-   * expired. Returns the remaining connection, if any.
+   * the credential is cleared (only if unchanged since we read it) and every
+   * connection-bound pending proposal is expired. Returns the remaining
+   * connection, if any. Called from the status route; the write path (#6)
+   * calls it again before executing approvals.
    */
   async validate(owner: string): Promise<GitHubConnectionInfo | null> {
     const connection = await this.connection(owner);
@@ -186,7 +232,7 @@ export class GitHubAuth {
       },
     });
     if (response.status === 401) {
-      await this.invalidate(owner, connection.id);
+      await this.invalidateSnapshot(owner, stored);
       return null;
     }
     return connection;
@@ -194,27 +240,47 @@ export class GitHubAuth {
 
   /** Disconnect and expire every proposal bound to the current connection. */
   async disconnect(owner: string): Promise<void> {
-    const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
-    await this.invalidate(owner, stored?.connectionId ?? undefined);
+    for (;;) {
+      const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
+      if (!stored) return;
+      const cleared = await this.db.compareAndSwap<Credential>(
+        owner,
+        "credentials",
+        CREDENTIAL_ID,
+        { ...stored },
+        { connectionId: null, account: null, scopes: [], secret: null },
+      );
+      if (!cleared) continue; // raced a concurrent connect; re-read and retry
+      if (stored.connectionId) await this.expireProposals(owner, stored.connectionId);
+      return;
+    }
   }
 
   /**
-   * Clear the credential and expire its pending work: every awaiting_review
-   * proposal bound to this connection becomes expired, and its waiting_approval
-   * task moves to waiting_input with an actionable question.
+   * Clear the credential and expire its pending work, but only when the stored
+   * row still matches what the caller observed (no TOCTOU against reconnects).
    */
   async invalidate(owner: string, connectionId?: string): Promise<void> {
     const stored = await this.db.get<Credential>(owner, "credentials", CREDENTIAL_ID);
-    const bound = connectionId ?? stored?.connectionId ?? null;
-    if (stored)
-      await this.db.put(owner, "credentials", {
-        id: CREDENTIAL_ID,
-        connectionId: null,
-        account: null,
-        scopes: [],
-        secret: null,
-      });
-    if (!bound) return;
+    if (!stored) return;
+    if (connectionId && stored.connectionId && stored.connectionId !== connectionId) return;
+    await this.invalidateSnapshot(owner, stored);
+  }
+
+  private async invalidateSnapshot(owner: string, stored: Credential): Promise<void> {
+    const cleared = await this.db.compareAndSwap<Credential>(
+      owner,
+      "credentials",
+      CREDENTIAL_ID,
+      { ...stored },
+      { connectionId: null, account: null, scopes: [], secret: null },
+    );
+    if (!cleared) return; // row changed under us; leave the newer connection alone
+    if (stored.connectionId) await this.expireProposals(owner, stored.connectionId);
+  }
+
+  /** Every awaiting_review proposal bound to the connection expires; its waiting_approval task moves to waiting_input. */
+  private async expireProposals(owner: string, connectionId: string): Promise<void> {
     const proposals = await this.db.list<{
       id: string;
       status: string;
@@ -222,7 +288,7 @@ export class GitHubAuth {
       taskId?: string;
     }>(owner, "actions");
     for (const proposal of proposals) {
-      if (proposal.status !== "awaiting_review" || proposal.connectionId !== bound) continue;
+      if (proposal.status !== "awaiting_review" || proposal.connectionId !== connectionId) continue;
       const expired = await this.db.compareAndSwap<{ id: string; status: string }>(
         owner,
         "actions",

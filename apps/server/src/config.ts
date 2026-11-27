@@ -164,18 +164,24 @@ export function readConfig(): Config {
     /\/+$/,
     "",
   );
-  if (!githubApiHost.startsWith("https://"))
-    throw new Error("GITHUB_API_HOST must be an https:// URL");
+  if (
+    !githubApiHost.startsWith("https://") ||
+    new URL(githubApiHost).pathname !== "/" ||
+    new URL(githubApiHost).search ||
+    new URL(githubApiHost).username ||
+    new URL(githubApiHost).password
+  )
+    throw new Error("GITHUB_API_HOST must be a plain https://host[:port] URL");
   if (process.env.GITHUB_WRITE_ENABLED === "true" && process.env.GITHUB_ENABLED !== "true")
     throw new Error("GITHUB_WRITE_ENABLED requires GITHUB_ENABLED=true");
-  if (
-    process.env.GITHUB_ENABLED === "true" &&
-    githubAuthMode === "pat" &&
-    !process.env.TOKEN_ENCRYPTION_KEY
-  )
-    throw new Error(
-      "GITHUB_AUTH_MODE=pat requires TOKEN_ENCRYPTION_KEY (32-byte base64) to encrypt tokens at rest",
-    );
+  if (process.env.GITHUB_ENABLED === "true" && githubAuthMode === "pat") {
+    const key = process.env.TOKEN_ENCRYPTION_KEY?.trim();
+    const bytes = key ? Buffer.from(key, "base64") : null;
+    if (!key || !bytes || bytes.length !== 32 || bytes.toString("base64") !== key)
+      throw new Error(
+        "GITHUB_AUTH_MODE=pat requires TOKEN_ENCRYPTION_KEY (32 random bytes encoded as base64) to encrypt tokens at rest",
+      );
+  }
   const config: Config = {
     mode,
     port,

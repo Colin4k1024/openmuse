@@ -299,14 +299,15 @@ export async function createApp(
   });
   app.get("/api/github/status", async (c) => {
     const owner = c.get("owner");
-    const connection = await github.connection(owner);
+    const probe = await github.probe(owner);
     return c.json({
       enabled: github.configured(),
       mode: config.githubAuthMode ?? "gh-cli",
       writeEnabled: config.githubWriteEnabled === true,
       allowedRepos: config.githubAllowedRepos ?? [],
-      connected: connection !== null,
-      account: connection?.account ?? null,
+      state: probe.state,
+      detail: probe.state === "unavailable" ? probe.detail : null,
+      account: probe.state === "connected" ? probe.connection.account : null,
     });
   });
   app.post("/api/github/connect", async (c) => {

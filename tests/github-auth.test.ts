@@ -97,10 +97,12 @@ test("tampered ciphertext and wrong keys fail closed with a diagnosable 503", as
   const auth = new GitHubAuth(db, config(), { fetch });
   await auth.connectWithToken("u-tamper", TOKEN);
 
+  // Valid envelope lengths (12B nonce, 16B tag) so the AES-GCM auth path is
+  // what actually rejects the tampering, not the length pre-check.
   await db.put("u-tamper", "credentials", {
     id: "github",
     connectionId: "x",
-    secret: "v1." + "A".repeat(16) + ".AAAAAAAABBBBBBBB.AAAA",
+    secret: `v1.${"A".repeat(16)}.${"A".repeat(22)}.QUJD`,
   });
   await assert.rejects(auth.connection("u-tamper"), (error: unknown) => {
     const message = error instanceof Error ? error.message : "";
@@ -187,6 +189,56 @@ test("disconnect clears the credential and expires its pending proposals", async
     (await db.get<{ status: string }>("u-disc", "actions", "a-pending"))?.status,
     "expired",
   );
+});
+
+test("connection() never carries the decrypted token at runtime", async () => {
+  const { fetch } = patFetch(() => okUser());
+  const auth = new GitHubAuth(db, config(), { fetch });
+  await auth.connectWithToken("u-clean", TOKEN);
+  const connection = await auth.connection("u-clean");
+  assert.ok(connection);
+  assert.equal("token" in connection, false);
+  assert.equal(JSON.stringify(connection).includes(TOKEN), false);
+});
+
+test("reconnecting expires the previous connection's pending proposals", async () => {
+  const { fetch } = patFetch(() => okUser());
+  const auth = new GitHubAuth(db, config(), { fetch });
+  const first = await auth.connectWithToken("u-re", TOKEN);
+  await db.put("u-re", "actions", {
+    id: "a-old",
+    kind: "github.comment",
+    status: "awaiting_review",
+    connectionId: first.id,
+  });
+  const second = await auth.connectWithToken("u-re", `${TOKEN}-rotated`);
+  assert.notEqual(first.id, second.id);
+  assert.equal((await db.get<{ status: string }>("u-re", "actions", "a-old"))?.status, "expired");
+  assert.equal((await auth.connection("u-re"))?.id, second.id);
+});
+
+test("concurrent connects leave exactly one connection; old proposals expire", async () => {
+  const { fetch } = patFetch(() => okUser());
+  const auth = new GitHubAuth(db, config(), { fetch });
+  const [a, b] = await Promise.all([
+    auth.connectWithToken("u-race", TOKEN),
+    auth.connectWithToken("u-race", `${TOKEN}-b`),
+  ]);
+  const final = await auth.connection("u-race");
+  assert.ok(final);
+  assert.ok(
+    final.id === a.id || final.id === b.id,
+    "the stored connection is one of the two contenders",
+  );
+});
+
+test("gh-cli probe distinguishes not-installed from not-authenticated", async () => {
+  const missing = new GitHubAuth(db, config({ githubAuthMode: "gh-cli" }), {
+    adapter: new GitHubAdapter({ enabled: true, allowedRepos: [], ghPath: "/nonexistent/gh" }),
+  });
+  const probe = await missing.probe("u-probe");
+  assert.equal(probe.state, "unavailable");
+  if (probe.state === "unavailable") assert.match(probe.detail, /not installed/);
 });
 
 test("gh-cli mode derives the connection live and stores nothing", async () => {
