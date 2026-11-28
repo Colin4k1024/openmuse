@@ -3,9 +3,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { AbstractAgent, type BaseEvent, type RunAgentInput } from "@ag-ui/client";
+import { EventType } from "@ag-ui/core";
+import type { AgentRunnerRunRequest } from "@copilotkit/runtime/v2";
+import { Observable } from "rxjs";
 import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
+import { ThreadStore } from "../apps/server/src/threads.ts";
+import { ownerContext } from "../apps/server/src/threads-context.ts";
+import { DurableThreadRunner } from "../apps/server/src/threads-runner.ts";
 
 // Issue #8: THREADS_BACKEND=local with no CPK_INTELLIGENCE_API_KEY at all.
 // Every assertion below runs without a CopilotKit Intelligence key or client.
@@ -378,4 +385,73 @@ test("egress audit: local mode never contacts CopilotKit Intelligence hosts", as
     hosts.filter((host) => host.endsWith("intelligence.copilotkit.ai")),
     [],
   );
+});
+
+test("a second concurrent run on one thread fails cleanly instead of hanging", async () => {
+  // Drive the runner directly: the inner InMemoryAgentRunner throws
+  // synchronously for a concurrent run on the same thread, which must
+  // surface as a run error event — never an unhandled rejection (a
+  // process crash on Node 22) or a never-completing stream.
+  class SlowAgent extends AbstractAgent {
+    constructor() {
+      super({ agentId: "default" });
+    }
+    run(input: RunAgentInput): Observable<BaseEvent> {
+      return new Observable((subscriber) => {
+        const timer = setTimeout(() => {
+          subscriber.next({
+            type: EventType.RUN_STARTED,
+            threadId: input.threadId,
+            runId: input.runId,
+          } as unknown as BaseEvent);
+          subscriber.next({
+            type: EventType.TEXT_MESSAGE_START,
+            messageId: "slow-1",
+            role: "assistant",
+          } as unknown as BaseEvent);
+          subscriber.complete();
+        }, 120);
+        return () => clearTimeout(timer);
+      });
+    }
+    clone(): SlowAgent {
+      return new SlowAgent();
+    }
+  }
+  const store = new ThreadStore(db);
+  const runner = new DurableThreadRunner(store);
+  const threadId = crypto.randomUUID();
+  await store.getOrCreate("local-user", threadId, "default");
+  const request = (runId: string): AgentRunnerRunRequest =>
+    ({
+      threadId,
+      agent: new SlowAgent(),
+      input: {
+        threadId,
+        runId,
+        messages: [],
+        state: {},
+        tools: [],
+        context: [],
+        forwardedProps: {},
+      },
+    }) as AgentRunnerRunRequest;
+  const first: Array<{ type: string; message?: string }> = [];
+  const second: Array<{ type: string; message?: string }> = [];
+  // The runner resolves the owner from the request async context, exactly as
+  // the Hono layer wraps every runtime.fetch call.
+  ownerContext.run("local-user", () =>
+    runner.run(request("run-1")).subscribe({ next: (event) => first.push(event as never) }),
+  );
+  ownerContext.run("local-user", () =>
+    runner.run(request("run-2")).subscribe({ next: (event) => second.push(event as never) }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(
+    first.some((event) => event.type === "TEXT_MESSAGE_START"),
+    "the first run must stream normally",
+  );
+  const rejection = second.find((event) => event.type === "RUN_ERROR");
+  assert.ok(rejection, "the concurrent run must end in a run error");
+  assert.match(rejection.message ?? "", /already in progress/);
 });

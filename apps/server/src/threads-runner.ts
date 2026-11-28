@@ -15,6 +15,15 @@ import { ownerContext } from "./threads-context.ts";
 
 const anonymousOwner = "anonymous";
 
+function runError(request: AgentRunnerRunRequest, message: string): BaseEvent {
+  return {
+    type: EventType.RUN_ERROR,
+    message,
+    threadId: request.threadId,
+    runId: request.input.runId,
+  } as unknown as BaseEvent;
+}
+
 /**
  * A durable AgentRunner for THREADS_BACKEND=local. The runtime runs in SSE
  * mode and executes agents in-process through the wrapped InMemoryAgentRunner;
@@ -69,11 +78,12 @@ export class DurableThreadRunner extends AgentRunner {
         // Append-only: persist just the suffix this process has not written
         // yet. After a restart the inner snapshot starts empty, so the first
         // run appends its events to the durable journal instead of replacing
-        // it; if the inner snapshot was ever truncated (its store is
-        // bounded), the already-persisted prefix is kept and nothing shrinks.
+        // it. If the bounded inner snapshot ever truncates below the high
+        // water mark, appending stops (until restart) rather than splicing a
+        // misaligned partial run into the journal.
         const already = this.persistedLength.get(request.threadId) ?? 0;
-        const suffix = events.length > already ? events.slice(already) : [];
-        this.persistedLength.set(request.threadId, events.length);
+        const suffix = events.length >= already ? events.slice(already) : [];
+        if (events.length >= already) this.persistedLength.set(request.threadId, events.length);
         await this.store.appendEvents(owner, request.threadId, suffix);
         await this.store.touch(owner, request.threadId);
       } catch (error) {
@@ -86,21 +96,29 @@ export class DurableThreadRunner extends AgentRunner {
       try {
         // Ownership first: the in-process journal is keyed only by thread id,
         // so a run on another owner's thread would mix and copy histories.
+        // Only this guard is fatal; its reason is safe to show the client.
         await this.guardOwnership(owner, request.threadId);
-        await this.store.upsertSummary(owner, request.threadId, agentId);
-      } catch (error) {
-        // Surface the rejection as a run error event: the client sees an
-        // honest failure and no agent work or journal copy happens.
-        subject.next({
-          type: EventType.RUN_ERROR,
-          message: error instanceof Error ? error.message : String(error),
-          threadId: request.threadId,
-          runId: request.input.runId,
-        } as unknown as BaseEvent);
+      } catch {
+        subject.next(runError(request, "Thread belongs to a different owner"));
         subject.complete();
         return;
       }
-      const source = this.inner.run(request);
+      // A summary write is best-effort: a transient store failure must not
+      // fail the user's turn (the SSE runner has no such row either).
+      void this.store.upsertSummary(owner, request.threadId, agentId).catch((error) => {
+        console.error("[OpenFuse] local thread summary upsert failed", error);
+      });
+      let source: Observable<BaseEvent>;
+      try {
+        // The inner runner throws synchronously for a concurrent run on the
+        // same thread ("Thread already running"); that must surface as a
+        // clean run error, never an unhandled rejection.
+        source = this.inner.run(request);
+      } catch {
+        subject.next(runError(request, "A run is already in progress on this conversation"));
+        subject.complete();
+        return;
+      }
       source.subscribe({
         next: (event) => subject.next(event),
         complete: () => {

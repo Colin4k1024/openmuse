@@ -307,13 +307,15 @@ export function buildThreadHooks(store: ThreadStore): CopilotRuntimeHooks {
       if (route.method !== "info") return;
       // SSE mode reports mutations:false, which makes the client reject
       // rename/archive/unarchive calls before they reach the server. Local
-      // mode serves those mutations, so advertise them.
+      // mode serves those mutations, so advertise them. The original body is
+      // consumed here, so rebuild it either way.
+      const text = await response.text();
       let body: Record<string, unknown>;
       try {
-        body = (await response.json()) as Record<string, unknown>;
+        body = JSON.parse(text) as Record<string, unknown>;
       } catch {
-        // A non-JSON info body (unexpected) is passed through untouched.
-        return;
+        // A non-JSON info body (unexpected) is rebuilt unchanged.
+        return new Response(text, { status: response.status, headers: response.headers });
       }
       const threadEndpoints = {
         ...((body.threadEndpoints as Record<string, unknown> | undefined) ?? {}),
@@ -322,9 +324,10 @@ export function buildThreadHooks(store: ThreadStore): CopilotRuntimeHooks {
         mutations: true,
         realtimeMetadata: false,
       };
-      const headers = new Headers(response.headers);
-      headers.set("Content-Type", "application/json");
-      return Response.json({ ...body, threadEndpoints }, { status: response.status, headers });
+      return Response.json(
+        { ...body, threadEndpoints },
+        { status: response.status, headers: response.headers },
+      );
     },
   };
 }
