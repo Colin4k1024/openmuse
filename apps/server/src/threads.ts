@@ -112,13 +112,30 @@ export class ThreadStore {
     return record?.events ?? [];
   }
 
-  /** Overwrites the journal with the runner's compacted event list (idempotent). */
-  async saveEvents(
+  /**
+   * Appends new events to the durable journal. Append-only by design: the
+   * in-process runner snapshot is volatile (and bounded), so overwriting it
+   * wholesale would shrink or wipe history after every restart. The caller
+   * passes only the suffix it has not persisted yet.
+   */
+  async appendEvents(
     owner: string,
     threadId: string,
-    events: Array<Record<string, unknown>>,
+    suffix: Array<Record<string, unknown>>,
   ): Promise<void> {
-    await this.db.put(owner, eventsKind, { id: threadId, events });
+    if (suffix.length === 0) return;
+    const stored = await this.listEvents(owner, threadId);
+    await this.db.put(owner, eventsKind, { id: threadId, events: [...stored, ...suffix] });
+  }
+
+  /**
+   * Rejects a thread that another owner already owns: the in-process runner
+   * store is keyed only by thread id, so a foreign thread id would otherwise
+   * copy that owner's live journal into this one's store.
+   */
+  async assertNotForeign(owner: string, threadId: string): Promise<void> {
+    if (await this.db.existsForOtherOwner(owner, threadsKind, threadId))
+      throw new Error("Thread belongs to a different owner");
   }
 
   async touch(owner: string, threadId: string): Promise<void> {
@@ -269,11 +286,16 @@ export function buildThreadHooks(store: ThreadStore): CopilotRuntimeHooks {
         case "threads/state": {
           throw Response.json({ state: null });
         }
+        case "threads/subscribe":
         case "threads/clear": {
-          // The runtime's clear wipes a process-global store across all
-          // owners; local mode deliberately denies it.
+          // clear: the runtime's clear wipes a process-global store across all
+          // owners; local mode deliberately denies it. subscribe: local mode
+          // exposes no realtime metadata plane (/info advertises none), so the
+          // honest answer is a denial rather than a half-real subscription.
           throw Response.json(
-            { error: "threads/clear is not available with THREADS_BACKEND=local" },
+            {
+              error: `${route.method} is not available with THREADS_BACKEND=local`,
+            },
             { status: 405 },
           );
         }
@@ -286,7 +308,13 @@ export function buildThreadHooks(store: ThreadStore): CopilotRuntimeHooks {
       // SSE mode reports mutations:false, which makes the client reject
       // rename/archive/unarchive calls before they reach the server. Local
       // mode serves those mutations, so advertise them.
-      const body = (await response.json()) as Record<string, unknown>;
+      let body: Record<string, unknown>;
+      try {
+        body = (await response.json()) as Record<string, unknown>;
+      } catch {
+        // A non-JSON info body (unexpected) is passed through untouched.
+        return;
+      }
       const threadEndpoints = {
         ...((body.threadEndpoints as Record<string, unknown> | undefined) ?? {}),
         list: true,
@@ -294,10 +322,9 @@ export function buildThreadHooks(store: ThreadStore): CopilotRuntimeHooks {
         mutations: true,
         realtimeMetadata: false,
       };
-      return Response.json(
-        { ...body, threadEndpoints },
-        { status: response.status, headers: { "Content-Type": "application/json" } },
-      );
+      const headers = new Headers(response.headers);
+      headers.set("Content-Type", "application/json");
+      return Response.json({ ...body, threadEndpoints }, { status: response.status, headers });
     },
   };
 }

@@ -24,7 +24,9 @@ Settings screen shows "Local storage" vs "CopilotKit Intelligence" accordingly.
 - A `DurableThreadRunner` journals each run's compacted AG-UI events (including
   your sent messages — the SDK embeds the run input in `RUN_STARTED`) to the
   install's own store (PGlite by default, Postgres with `DATABASE_URL`) as
-  owner-scoped `threads` and `thread-events` records.
+  owner-scoped `threads` and `thread-events` records. Journal writes are
+  append-only, and runs/connects on a thread id owned by a different account
+  are rejected before any agent work.
 - The thread REST surface (`GET/PATCH/DELETE /api/copilotkit/threads...`) is
   served from that store, scoped to the signed-in owner; a forged `userId` is
   ignored. `POST threads/clear` is denied (405).
@@ -46,8 +48,14 @@ pre-existing sink and unrelated to thread storage.
 
 - No migration of existing cloud threads: switching a keyed install to `local`
   starts a fresh local history.
-- No realtime thread-metadata sync (the list refreshes on app interaction).
-- The per-thread event journal has no retention cap in this version.
+- No realtime thread-metadata sync (the list refreshes on app interaction;
+  `threads/subscribe` is denied 405).
+- The durable journal is append-only and never shrinks. It has no retention
+  cap yet; if the in-process snapshot's own bounds are ever exceeded (1000
+  threads / 100 runs per thread / 512 MB), new events stop being appended
+  until the process restarts rather than history being lost.
+- Threads are not auto-named in local mode (auto-naming is Intelligence-only);
+  the menu rename works as usual.
 - A reply interrupted by a server crash loses that run's journal write
   (completed runs persist); the partial reply is still streamed to the app.
 

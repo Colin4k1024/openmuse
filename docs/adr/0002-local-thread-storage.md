@@ -93,8 +93,10 @@ migration a config change). Not intended as a permanent divergence.
 - Realtime thread-metadata sync (`threads/subscribe`) is not offered in local
   mode — the client only calls it when `/info` advertises a realtime plane, which
   local mode never does.
-- The event journal is unbounded per thread in this first cut; compaction happens
-  per run via the SDK, but there is no retention policy yet.
+- The event journal is append-only and unbounded per thread in this first cut;
+  no retention policy yet. The in-process snapshot it is sourced from is bounded
+  (1000 threads / 100 runs / 512 MB), so once those bounds are exceeded new
+  events stop being appended until restart rather than history being lost.
 - Crash mid-reply loses that run's journal write (persistence happens when the
   stream settles); completed runs survive restarts.
 - Telemetry is unaffected and remains separately opt-out controlled

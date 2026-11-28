@@ -1,4 +1,5 @@
 import type { BaseEvent } from "@ag-ui/client";
+import { EventType } from "@ag-ui/core";
 import {
   AgentRunner,
   type AgentRunnerConnectRequest,
@@ -22,11 +23,20 @@ const anonymousOwner = "anonymous";
  * owner-scoped ThreadStore, and replays it from the store on connect so
  * `copilotkit.connectAgent` works across full process restarts.
  *
+ * The inner store is volatile and bounded (process-global, keyed only by
+ * thread id), so persistence is append-only: each write adds only the events
+ * this process has not persisted yet, and the journal never shrinks. The
+ * inner store also has no owner dimension, so run/connect verify thread
+ * ownership first — a foreign thread id must not read or copy another
+ * owner's journal.
+ *
  * ɵsupportsLocalThreadEndpoints stays unset: thread reads are served by the
  * owner-scoped Hono hooks, not by this runner.
  */
 export class DurableThreadRunner extends AgentRunner {
   private readonly inner: InMemoryAgentRunner & LocalThreadEndpointRunner;
+  /** Per thread: how many events of the inner snapshot this process has persisted. */
+  private readonly persistedLength = new Map<string, number>();
 
   constructor(private readonly store: ThreadStore) {
     super();
@@ -39,24 +49,32 @@ export class DurableThreadRunner extends AgentRunner {
     return ownerContext.getStore() ?? anonymousOwner;
   }
 
+  private async guardOwnership(owner: string, threadId: string): Promise<void> {
+    // The runner's in-process journal is keyed only by thread id, so a thread
+    // owned by a different account must be rejected before any delegation.
+    await this.store.assertNotForeign(owner, threadId);
+  }
+
   run(request: AgentRunnerRunRequest): Observable<BaseEvent> {
     const owner = this.owner();
     const agentId = request.agent.agentId ?? "default";
-    void this.store.upsertSummary(owner, request.threadId, agentId).catch((error) => {
-      console.error("[OpenFuse] local thread summary upsert failed", error);
-    });
-    const source = this.inner.run(request);
     const subject = new ReplaySubject<BaseEvent>(Infinity);
     // Persist after the stream settles: the inner runner finalizes, compacts
-    // and appends the run exactly once, so this mirrors the final journal.
+    // and appends the run exactly once, so the inner snapshot is final.
     const persist = async () => {
       try {
-        const events = this.inner.getThreadEvents(request.threadId);
-        await this.store.saveEvents(
-          owner,
-          request.threadId,
-          events as Array<Record<string, unknown>>,
-        );
+        const events = this.inner.getThreadEvents(request.threadId) as Array<
+          Record<string, unknown>
+        >;
+        // Append-only: persist just the suffix this process has not written
+        // yet. After a restart the inner snapshot starts empty, so the first
+        // run appends its events to the durable journal instead of replacing
+        // it; if the inner snapshot was ever truncated (its store is
+        // bounded), the already-persisted prefix is kept and nothing shrinks.
+        const already = this.persistedLength.get(request.threadId) ?? 0;
+        const suffix = events.length > already ? events.slice(already) : [];
+        this.persistedLength.set(request.threadId, events.length);
+        await this.store.appendEvents(owner, request.threadId, suffix);
         await this.store.touch(owner, request.threadId);
       } catch (error) {
         // A failed journal write degrades to the in-memory behavior of the
@@ -64,15 +82,35 @@ export class DurableThreadRunner extends AgentRunner {
         console.error("[OpenFuse] local thread journal save failed", error);
       }
     };
-    source.subscribe({
-      next: (event) => subject.next(event),
-      complete: () => {
-        void persist().finally(() => subject.complete());
-      },
-      error: (error) => {
-        void persist().finally(() => subject.error(error));
-      },
-    });
+    void (async () => {
+      try {
+        // Ownership first: the in-process journal is keyed only by thread id,
+        // so a run on another owner's thread would mix and copy histories.
+        await this.guardOwnership(owner, request.threadId);
+        await this.store.upsertSummary(owner, request.threadId, agentId);
+      } catch (error) {
+        // Surface the rejection as a run error event: the client sees an
+        // honest failure and no agent work or journal copy happens.
+        subject.next({
+          type: EventType.RUN_ERROR,
+          message: error instanceof Error ? error.message : String(error),
+          threadId: request.threadId,
+          runId: request.input.runId,
+        } as unknown as BaseEvent);
+        subject.complete();
+        return;
+      }
+      const source = this.inner.run(request);
+      source.subscribe({
+        next: (event) => subject.next(event),
+        complete: () => {
+          void persist().finally(() => subject.complete());
+        },
+        error: (error) => {
+          void persist().finally(() => subject.error(error));
+        },
+      });
+    })();
     return subject.asObservable();
   }
 
@@ -93,6 +131,7 @@ export class DurableThreadRunner extends AgentRunner {
         }
       };
       void (async () => {
+        await this.guardOwnership(owner, request.threadId);
         // Read the durable journal first: after a restart it is the only
         // history; while a run is in flight it lags the inner store by at
         // most the current (unfinalized) run.
@@ -105,7 +144,9 @@ export class DurableThreadRunner extends AgentRunner {
         // The inner runner is mid-run: inner.connect replays its compacted
         // journal (which we just emitted from the store) and then tails the
         // live run. Skip exactly the historic prefix; the live tail carries
-        // new events only.
+        // new events only. A run that finalizes between the stored read and
+        // this subscription can make the skip over-count; that run then
+        // reaches the next connect instead (the journal is never corrupted).
         let skip = this.inner.getThreadEvents(request.threadId).length;
         this.inner.connect(request).subscribe({
           next: (event) => {

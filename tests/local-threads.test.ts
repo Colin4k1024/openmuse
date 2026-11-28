@@ -149,13 +149,67 @@ test("/info advertises the local thread mutations the client guards on", async (
   });
 });
 
-test("threads/clear is denied instead of wiping another owner's data", async () => {
-  const response = await server.app.request("/api/copilotkit/threads/clear", {
+test("threads/clear and threads/subscribe are denied instead of half-working", async () => {
+  const clear = await server.app.request("/api/copilotkit/threads/clear", {
     method: "POST",
     headers: headers(),
     body: "{}",
   });
-  assert.equal(response.status, 405);
+  assert.equal(clear.status, 405);
+  const subscribe = await server.app.request("/api/copilotkit/threads/subscribe", {
+    method: "POST",
+    headers: headers(),
+    body: "{}",
+  });
+  assert.equal(subscribe.status, 405);
+});
+
+test("a thread owned by another owner rejects runs and connects over the wire", async () => {
+  const foreignId = crypto.randomUUID();
+  await db.put("other-user", "threads", {
+    id: foreignId,
+    name: null,
+    archived: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    agentId: "default",
+  });
+  const run = await server.app.request("/api/copilotkit/agent/default/run", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      threadId: foreignId,
+      runId: crypto.randomUUID(),
+      messages: [{ id: "user-x", role: "user", content: "steal history" }],
+      state: {},
+      tools: [],
+      context: [],
+      forwardedProps: {},
+    }),
+  });
+  // The run is rejected before any agent work or journal copy happens: the
+  // client sees a run error naming the reason.
+  assert.match(await run.text(), /different owner/);
+  const connect = await server.app.request("/api/copilotkit/agent/default/connect", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      threadId: foreignId,
+      runId: crypto.randomUUID(),
+      messages: [],
+      state: {},
+      tools: [],
+      context: [],
+      forwardedProps: {},
+    }),
+  });
+  const connectBody = await connect.text();
+  assert.ok(
+    !connectBody.includes("steal history"),
+    "a foreign connect must not replay another owner's journal",
+  );
+  assert.equal(await db.get("local-user", "threads", foreignId), null);
+  assert.equal(await db.get("local-user", "thread-events", foreignId), null);
 });
 
 test("runs journal events locally and connect replays them across a restart", async () => {
@@ -209,6 +263,40 @@ test("runs journal events locally and connect replays them across a restart", as
   const replay = await connect.text();
   assert.match(replay, /Plan the week/);
   assert.match(replay, /TEXT_MESSAGE_CONTENT/);
+
+  // restart -> run -> connect: the durable journal must never shrink. The
+  // inner in-process snapshot starts empty on the new app, so this run's
+  // persistence appends instead of replacing the history.
+  const secondRun = await server.app.request("/api/copilotkit/agent/default/run", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      ...runBody,
+      runId: crypto.randomUUID(),
+      messages: [{ id: "user-3", role: "user", content: "Book the dentist" }],
+    }),
+  });
+  assert.equal(secondRun.status, 200, await secondRun.clone().text());
+  await secondRun.text();
+  const journalAfter = await db.get<{ id: string; events: Array<Record<string, unknown>> }>(
+    "local-user",
+    "thread-events",
+    threadId,
+  );
+  assert.ok(journalAfter, "the journal must survive the second run");
+  assert.ok(
+    journalAfter.events.length > (journal?.events.length ?? 0),
+    "the journal must grow, never shrink, across a restart + new run",
+  );
+  const secondConnect = await server.app.request("/api/copilotkit/agent/default/connect", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ ...runBody, runId: crypto.randomUUID() }),
+  });
+  assert.equal(secondConnect.status, 200, await secondConnect.clone().text());
+  const secondReplay = await secondConnect.text();
+  assert.match(secondReplay, /Plan the week/, "the first turn must still replay");
+  assert.match(secondReplay, /Book the dentist/, "the post-restart turn must replay too");
 
   // The REST history endpoint folds the same journal.
   const history = await (
