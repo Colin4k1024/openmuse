@@ -11,6 +11,8 @@
       "!**/android",
       "!**/.openfuse",
       "!**/.openmuse",
+      "!**/.mimosa",
+      "!**/.video_agent",
       "!**/artifacts"
     ]
   },
