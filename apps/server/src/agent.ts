@@ -1,9 +1,11 @@
 import "./config.ts";
 import { HttpAgent } from "@ag-ui/client";
 import {
+  type AgentRunner,
   type AgentsFactory,
   type CopilotKitIntelligence,
   CopilotRuntime,
+  type CopilotRuntimeHooks,
   createCopilotHonoHandler,
 } from "@copilotkit/runtime/v2";
 import type { Auth } from "./auth.ts";
@@ -29,7 +31,14 @@ export function makeRuntime(
   config: Config,
   service: AgentService,
   auth: Auth,
-  intelligence: CopilotKitIntelligence,
+  options: {
+    /** CopilotKit Intelligence cloud threads; omit to run in SSE mode locally. */
+    intelligence?: CopilotKitIntelligence;
+    /** SSE-mode runner (THREADS_BACKEND=local durable journal). */
+    runner?: AgentRunner;
+    /** Owner-scoped local thread REST interception. */
+    hooks?: CopilotRuntimeHooks;
+  } = {},
 ) {
   // Built on first use, then shared so live mode reuses one TypeSafe client across requests.
   let jevAdapter: JevAdapter | undefined;
@@ -55,16 +64,30 @@ export function makeRuntime(
               sharedJevAdapter(),
             ),
   });
-  const runtime = new CopilotRuntime({
-    agents,
-    intelligence,
-    // The shared CopilotKit sink carries this tag onto existing PostHog events.
-    telemetryProperties: { accessibility_title: "OpenFuse" },
-    identifyUser: async (request) => ({
-      id: await auth.owner(request.headers.get("authorization") ?? undefined),
-      name: "OpenFuse user",
-    }),
-    generateThreadNames: false,
+  const runtime = options.intelligence
+    ? new CopilotRuntime({
+        agents,
+        intelligence: options.intelligence,
+        // The shared CopilotKit sink carries this tag onto existing PostHog events.
+        telemetryProperties: { accessibility_title: "OpenFuse" },
+        identifyUser: async (request) => ({
+          id: await auth.owner(request.headers.get("authorization") ?? undefined),
+          name: "OpenFuse user",
+        }),
+        generateThreadNames: false,
+      })
+    : // SSE mode: agents run in-process, on the durable local runner when
+      // THREADS_BACKEND=local (the Intelligence runtime wires its own runner
+      // and rejects an explicit one).
+      new CopilotRuntime({
+        agents,
+        ...(options.runner ? { runner: options.runner } : {}),
+        // The shared CopilotKit sink carries this tag onto existing PostHog events.
+        telemetryProperties: { accessibility_title: "OpenFuse" },
+      });
+  return createCopilotHonoHandler({
+    runtime,
+    basePath: "/api/copilotkit",
+    ...(options.hooks ? { hooks: options.hooks } : {}),
   });
-  return createCopilotHonoHandler({ runtime, basePath: "/api/copilotkit" });
 }

@@ -44,6 +44,8 @@ export interface Config {
   agentUrl?: string;
   agentToken?: string;
   intelligenceApiKey?: string;
+  /** Where conversation threads persist: CopilotKit Intelligence cloud, or this install's own store. */
+  threadsBackend?: "intelligence" | "local";
   googleClientId?: string;
   googleClientSecret?: string;
   googleRedirectUri: string;
@@ -85,9 +87,18 @@ export function required(name: string, message: string, value = process.env[name
   return value.trim();
 }
 
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
+/**
+ * Where conversation threads persist. `THREADS_BACKEND` pins a mode; unset it
+ * auto-resolves: an Intelligence key keeps existing installs on the cloud, a
+ * keyless install stays fully local (issue #8's privacy goal).
+ */
+export function resolveThreadsBackend(config: Config): "intelligence" | "local" {
+  if (config.threadsBackend) return config.threadsBackend;
+  return config.intelligenceApiKey?.trim() ? "intelligence" : "local";
+}
+
+export function assertApiDeploymentConfig(config: Config): void {
+  if (resolveThreadsBackend(config) !== "intelligence") return;
   required(
     "CPK_INTELLIGENCE_API_KEY",
     intelligenceKeyRequiredMessage,
@@ -137,6 +148,13 @@ export function readConfig(): Config {
   const jevMode = process.env.JEV_MODE ?? "off";
   if (jevMode !== "off" && jevMode !== "sample" && jevMode !== "live")
     throw new Error("JEV_MODE must be off, sample or live");
+  const threadsBackendEnv = process.env.THREADS_BACKEND?.trim().toLowerCase();
+  if (threadsBackendEnv && threadsBackendEnv !== "intelligence" && threadsBackendEnv !== "local")
+    throw new Error("THREADS_BACKEND must be intelligence or local");
+  const intelligenceApiKey = process.env.CPK_INTELLIGENCE_API_KEY?.trim();
+  const threadsBackend =
+    (threadsBackendEnv as "intelligence" | "local" | undefined) ??
+    (intelligenceApiKey ? "intelligence" : "local");
   const typesafeApiKey = process.env.TYPESAFE_API_KEY?.trim();
   if (jevMode === "live" && !typesafeApiKey)
     throw new Error("JEV_MODE=live requires a nonblank TYPESAFE_API_KEY");
@@ -206,7 +224,11 @@ export function readConfig(): Config {
     agentBackend: backend,
     agentUrl: process.env.AGENT_URL,
     agentToken: process.env.AGENT_TOKEN,
-    intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
+    intelligenceApiKey:
+      threadsBackend === "intelligence"
+        ? required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage, intelligenceApiKey)
+        : intelligenceApiKey,
+    threadsBackend,
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,

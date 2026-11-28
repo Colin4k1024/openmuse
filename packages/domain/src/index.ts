@@ -254,6 +254,8 @@ export interface Workspace {
     configured: boolean;
     openbotConfigured: boolean;
     richThreads?: boolean;
+    /** Where conversation threads persist: CopilotKit Intelligence or this install's own store. */
+    threadsBackend?: "intelligence" | "local";
   };
 }
 

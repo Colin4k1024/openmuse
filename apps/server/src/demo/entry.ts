@@ -8,7 +8,15 @@ import { createStore } from "../db.ts";
 import { createDemoModel, demoModel } from "./model.ts";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
-const intelligenceApiKey = required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage);
+const intelligenceApiKey = process.env.CPK_INTELLIGENCE_API_KEY?.trim();
+const threadsBackendEnv = process.env.THREADS_BACKEND?.trim().toLowerCase();
+if (threadsBackendEnv && threadsBackendEnv !== "intelligence" && threadsBackendEnv !== "local")
+  throw new Error("THREADS_BACKEND must be intelligence or local");
+if (threadsBackendEnv === "intelligence" && !intelligenceApiKey)
+  throw new Error(intelligenceKeyRequiredMessage);
+// The demo defaults to keyless local threads; the API child inherits the key
+// only when one is present.
+const threadsBackend = threadsBackendEnv ?? (intelligenceApiKey ? "intelligence" : "local");
 const jevMode = process.env.DEMO_JEV_MODE ?? "sample";
 if (jevMode !== "sample" && jevMode !== "live")
   throw new Error("DEMO_JEV_MODE must be sample or live");
@@ -96,7 +104,8 @@ const api = spawn(
         process.env.DEMO_ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081",
       DO_NOT_TRACK: "1",
       COPILOTKIT_TELEMETRY_DISABLED: "true",
-      CPK_INTELLIGENCE_API_KEY: intelligenceApiKey,
+      THREADS_BACKEND: threadsBackend,
+      ...(intelligenceApiKey ? { CPK_INTELLIGENCE_API_KEY: intelligenceApiKey } : {}),
     },
   },
 );

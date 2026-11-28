@@ -9,7 +9,7 @@ The deployment is single-owner and self-hosted. Under the default configuration 
 - Code is read and written through the local `gh` CLI and local git; no code is sent to any third party other than GitHub itself.
 - Credentials are stored only as AES-256-GCM envelopes via [vault.ts](../packages/integrations/src/vault.ts) under `TOKEN_ENCRYPTION_KEY`.
 - LLM inference is expected to use a local OpenAI-compatible endpoint (`OPENAI_BASE_URL`, [tanstack-agent.ts](../apps/server/src/engine/tanstack-agent.ts)); when a cloud provider is configured instead, the operator accepts that prompts containing repository excerpts leave the host. This choice is explicit configuration, not a default.
-- Conversation persistence is local once `THREADS_BACKEND=local` ships ([#8](https://github.com/Colin4k1024/openmuse/issues/8)); until then the CopilotKit Intelligence requirement of [config.ts](../apps/server/src/config.ts) is unchanged.
+- Conversation persistence is local by default without a key (`THREADS_BACKEND=local`, [#8](https://github.com/Colin4k1024/openmuse/issues/8), [docs/LOCAL-THREADS.md](LOCAL-THREADS.md)); a `CPK_INTELLIGENCE_API_KEY` switches it back to CopilotKit Intelligence.
 
 ## Proposed OpenMuse configuration
 

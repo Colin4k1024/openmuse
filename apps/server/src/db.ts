@@ -90,6 +90,14 @@ export class Store {
       id,
     ]);
   }
+  /** Whether a record of this kind and id exists under a different owner. */
+  async existsForOtherOwner(owner: string, kind: string, id: string): Promise<boolean> {
+    const result = await this.db.query(
+      "SELECT 1 FROM records WHERE kind=$1 AND id=$2 AND owner<>$3 LIMIT 1",
+      [kind, id, owner],
+    );
+    return result.rows.length > 0;
+  }
   async compareAndSwap<T>(
     owner: string,
     kind: string,

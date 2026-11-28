@@ -18,7 +18,7 @@ import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { ComputerService, type DockerRunner, resolveComputerDeployment } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
-import { assertApiDeploymentConfig, type Config } from "./config.ts";
+import { assertApiDeploymentConfig, type Config, resolveThreadsBackend } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
@@ -28,6 +28,9 @@ import { GitHubAuth } from "./github-auth.ts";
 import { GitHubExecutor } from "./github-executor.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
+import { buildThreadHooks, ThreadStore } from "./threads.ts";
+import { ownerContext } from "./threads-context.ts";
+import { DurableThreadRunner } from "./threads-runner.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -62,8 +65,18 @@ export async function createApp(
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
   const agent = new AgentService(db, config, workspace, files, actions, browser, computer, github);
-  const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
-  const runtime = makeRuntime(config, agent, auth, intelligence);
+  const threadsBackend = resolveThreadsBackend(config);
+  const threadStore = new ThreadStore(db);
+  const intelligence =
+    threadsBackend === "intelligence"
+      ? new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey ?? "" })
+      : undefined;
+  const runtime = makeRuntime(config, agent, auth, {
+    intelligence,
+    ...(threadsBackend === "local"
+      ? { runner: new DurableThreadRunner(threadStore), hooks: buildThreadHooks(threadStore) }
+      : {}),
+  });
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
   app.use("*", async (c, next) => {
@@ -116,6 +129,7 @@ export async function createApp(
       mode: config.mode,
       agentConfigured: agentConfigured(config),
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
+      threadsBackend,
     }),
   );
   let loginWindow = 0,
@@ -237,8 +251,13 @@ export async function createApp(
     });
     const main = await db.get<{ threadId: string }>(owner, "conversation-settings", "main");
     if (!main) throw new AppError("Main conversation could not be loaded", 503);
+    if (threadsBackend === "local") {
+      // Keyless local mode: the thread row lives in this install's store.
+      await threadStore.getOrCreate(owner, main.threadId, "default");
+      return c.json({ threadId: main.threadId, existing: true });
+    }
     try {
-      await intelligence.getOrCreateThread({
+      await intelligence?.getOrCreateThread({
         threadId: main.threadId,
         userId: owner,
         agentId: "default",
@@ -388,7 +407,8 @@ export async function createApp(
         "Configure a model and provider API key, or a valid AG-UI endpoint, to start chat",
         503,
       );
-    const response = await runtime.fetch(c.req.raw);
+    // The durable runner and thread hooks read the owner from this context.
+    const response = await ownerContext.run(c.get("owner"), () => runtime.fetch(c.req.raw));
     // Runtime 1.70 emits SSE strings; a WHATWG Response body requires byte chunks.
     const encoder = new TextEncoder();
     const body = response.body?.pipeThrough(
