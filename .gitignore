@@ -13,3 +13,5 @@ apps/mobile/android/
 .DS_Store
 *.tsbuildinfo
 artifacts/
+.mimosa/
+.video_agent/
