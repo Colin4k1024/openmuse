@@ -39,15 +39,46 @@ const missingKeyMessage =
   "then set the generated server-only key. " +
   "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
 
-test("every API mode rejects a missing or blank Intelligence key", () => {
+test("Intelligence-backed modes reject a missing or blank key; local backend needs none", () => {
   for (const mode of [sampleConfig, liveConfig()]) {
     for (const key of [undefined, "", " \t\n"]) {
-      assert.throws(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }), {
-        name: "Error",
-        message: missingKeyMessage,
-      });
+      // Auto mode with no key resolves to the local backend, which must not
+      // throw; pinning intelligence requires the key (issue #8 acceptance 1).
+      assert.doesNotThrow(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }));
+      assert.throws(
+        () =>
+          assertApiDeploymentConfig({
+            ...mode,
+            threadsBackend: "intelligence",
+            intelligenceApiKey: key,
+          }),
+        { name: "Error", message: missingKeyMessage },
+      );
     }
   }
+});
+
+test("THREADS_BACKEND resolves to local without a key and validates explicit values", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  delete process.env.THREADS_BACKEND;
+  delete process.env.CPK_INTELLIGENCE_API_KEY;
+  assert.equal(readConfig().threadsBackend, "local");
+  assert.equal(readConfig().intelligenceApiKey, undefined);
+  process.env.CPK_INTELLIGENCE_API_KEY = "fixture-key";
+  assert.equal(readConfig().threadsBackend, "intelligence");
+  process.env.THREADS_BACKEND = "local";
+  assert.equal(readConfig().threadsBackend, "local");
+  assert.equal(readConfig().intelligenceApiKey, "fixture-key");
+  process.env.THREADS_BACKEND = "INTELLIGENCE";
+  assert.equal(readConfig().threadsBackend, "intelligence");
+  process.env.THREADS_BACKEND = "bogus";
+  assert.throws(() => readConfig(), /THREADS_BACKEND/);
 });
 
 test("every API mode accepts a non-empty Intelligence key", () => {

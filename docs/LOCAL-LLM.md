@@ -39,4 +39,4 @@ Small models (< ~14B parameters) routinely fail 1–2. If a model fails the bar,
 
 ## Privacy boundary
 
-With a local endpoint, prompts (including repository content and personal context) never leave the host. Pair with `THREADS_BACKEND=local` ([Issue #8](https://github.com/Colin4k1024/openmuse/issues/8)) for fully local conversation persistence; until then, CopilotKit Intelligence remains a cloud dependency for thread storage.
+With a local endpoint, prompts (including repository content and personal context) never leave the host. Pair with keyless local thread storage (`THREADS_BACKEND=local`, [docs/LOCAL-THREADS.md](LOCAL-THREADS.md)) for fully local conversation persistence; with a `CPK_INTELLIGENCE_API_KEY` set, CopilotKit Intelligence remains the thread store.

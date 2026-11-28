@@ -44,6 +44,8 @@ services:
         generateValue: true
       - key: OPENAI_API_KEY
         sync: false
+      # Optional: without a key, threads persist locally (THREADS_BACKEND
+      # resolves to local; see docs/LOCAL-THREADS.md).
       - key: CPK_INTELLIGENCE_API_KEY
         sync: false
       # Use the CLI-issued identity for the same Intelligence project as the key.

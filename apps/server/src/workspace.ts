@@ -14,7 +14,7 @@ import { GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
 import type { ActionService } from "./actions.ts";
 import { agentConfigured } from "./agent.ts";
-import type { Config } from "./config.ts";
+import { type Config, resolveThreadsBackend } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
@@ -365,6 +365,7 @@ export class WorkspaceService {
         configured: agentConfigured(this.config),
         openbotConfigured: false,
         richThreads: true,
+        threadsBackend: resolveThreadsBackend(this.config),
       },
     };
   }
